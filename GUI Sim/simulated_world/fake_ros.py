@@ -58,12 +58,17 @@ class _FakeSubscription:
 
 
 class _FakePublisher:
-    """Returned by create_publisher. Publish is a no-op."""
-    def __init__(self, topic):
+    """Returned by create_publisher. publish() loops back to any local
+    subscription on the same topic so request/observe patterns (e.g.
+    /data/toggle_collect driven by the GUI itself) work without an
+    outside publisher."""
+    def __init__(self, topic, node):
         self.topic = topic
+        self._node = node
     def publish(self, msg):
-        # No-op — nothing else is listening in the fake universe.
-        pass
+        sub = self._node._fake_subs.get(self.topic)
+        if sub is not None:
+            sub.callback(msg)
 
 
 class _FakeNode:
@@ -95,7 +100,7 @@ class _FakeNode:
         return sub
 
     def create_publisher(self, msg_type, topic, qos):
-        pub = _FakePublisher(topic)
+        pub = _FakePublisher(topic, self)
         self._fake_pubs[topic] = pub
         return pub
 

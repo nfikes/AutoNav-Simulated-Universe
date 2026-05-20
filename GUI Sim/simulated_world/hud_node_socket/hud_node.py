@@ -5682,8 +5682,24 @@ class HudWindow(QMainWindow):
                 break
 
     # -----------------------------------------------------------------
-    # REC mode — driven by /data/toggle_collect from base_automator
+    # REC mode — driven by /data/toggle_collect (base_automator from a
+    # test script, or the HUD itself via _request_record_toggle / R key).
     # -----------------------------------------------------------------
+    def _request_record_toggle(self):
+        """Flip ROS bag recording. Publishes the inverse of the current
+        latest_recording_active on /data/toggle_collect; the existing
+        subscriber updates state and _rec_tick reacts on the next tick.
+        Works whether or not a test script is also driving the topic."""
+        node = getattr(self, '_ros_node', None)
+        if node is None:
+            return
+        pub = getattr(node, 'toggle_collect_pub', None)
+        if pub is None:
+            return
+        msg = Bool()
+        msg.data = not bool(getattr(node, 'latest_recording_active', False))
+        pub.publish(msg)
+
     def _rec_tick(self):
         """20 Hz tick. Reads HudNode.latest_recording_active and:
           • On OFF→ON edge: snapshot existing dot styles, show the
@@ -6271,9 +6287,18 @@ class HudWindow(QMainWindow):
         # 'A' toggles auto mode. No modifiers so it doesn't fight Ctrl+A
         # or similar; intentionally only handled at the window level so
         # that typing 'a' into a focused QLineEdit (send_goal / GPS
-        # field / lock password) still enters the character.
+        # field / lock password) still enters the character. 'P' and 'R'
+        # follow the same pattern: 'P' toggles Performance mode, 'R'
+        # toggles ROS-bag recording. Both work from any screen and at
+        # any time — no test script required.
         if key == Qt.Key_A and not event.modifiers():
             self._toggle_auto_mode()
+            return
+        if key == Qt.Key_P and not event.modifiers():
+            self._on_performance_clicked()
+            return
+        if key == Qt.Key_R and not event.modifiers():
+            self._request_record_toggle()
             return
 
         # --- Scrub mode: arrows move the slider, Enter exits ---
@@ -8862,16 +8887,20 @@ if _HAS_ROS:
                 self._cb_autonomous_mode, _RELIABLE_QOS,
             )
 
-            # Test recording state — the t000_automator publishes True
-            # on the A-button press that starts a test, False on the
-            # press that ends it. Drives the GUI's REC indicator:
-            # device-dot black↔red ramp + transparent red overlay over
-            # the central widget so the operator can see at a glance
-            # that a bag is being recorded.
+            # Test recording state — base_automator publishes True on
+            # the A-button press that starts a test, False on the press
+            # that ends it. The HUD itself also publishes here from the
+            # R key (see HudWindow._request_record_toggle) so an operator
+            # can record without a test script. Either source drives the
+            # GUI's REC indicator: device-dot black↔red ramp + transparent
+            # red overlay over the central widget.
             self.latest_recording_active = False
             self.create_subscription(
                 Bool, '/data/toggle_collect',
                 self._cb_recording_toggle, _RELIABLE_QOS,
+            )
+            self.toggle_collect_pub = self.create_publisher(
+                Bool, '/data/toggle_collect', _RELIABLE_QOS,
             )
 
             # Xbox D-pad → GUI arrow keys. HudWindow assigns
