@@ -1,0 +1,20 @@
+# Virtual environments
+.venv/
+**/.venv/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS metadata
+.DS_Store
+._*
+
+# Heavy local data — kept on disk, never committed
+Baked_Playbacks/
+example-playback-csv/
+tile_cache/
+
+# Editor / Claude local state
+.claude/settings.local.json

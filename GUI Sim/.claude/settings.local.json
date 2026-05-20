@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python *)",
+      "Bash(pip install *)",
+      "Bash(uv --version)",
+      "Bash(uv pip *)",
+      "Bash(git -C \"C:\\\\Users\\\\natha\\\\GitHub-Projects\\\\AutoNav_25-26\" status --short)",
+      "Bash(git -C \"C:\\\\Users\\\\natha\\\\GitHub-Projects\\\\AutoNav_25-26\" rev-parse --abbrev-ref HEAD)",
+      "Bash(git *)",
+      "Bash(echo \"exit code: $?\")"
+    ]
+  }
+}
