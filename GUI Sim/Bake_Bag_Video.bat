@@ -1,13 +1,13 @@
 @echo off
 setlocal enabledelayedexpansion
 set "ROOT=%~dp0"
-set "SIM=%ROOT%simulated_universe"
+set "SIM=%ROOT%simulated_world"
 set "PY=%SIM%\.venv\Scripts\python.exe"
 
 if not exist "%PY%" (
     echo [ERROR] Python venv not found at:
     echo   %PY%
-    echo Run uv venv inside simulated_universe\ to recreate it.
+    echo Run uv venv inside simulated_world\ to recreate it.
     pause
     exit /b 1
 )

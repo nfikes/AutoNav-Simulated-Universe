@@ -100,6 +100,7 @@ subprocess.Popen = _fake_subprocess_popen
 import numpy as np
 
 # Step 2: now safe to import the real GUI.
+sys.path.insert(0, "hud_node_socket")
 import hud_node
 
 
