@@ -681,45 +681,31 @@ def _build_terrain(mesh):
 
 # ── Visualization ──────────────────────────────────────────────────
 
-def _setup_figure(agents, terrain_img=None, terrain_extent=None):
-    """Build the 3-panel benchmark figure via the shared sim_view helper.
+def _is_headless_backend():
+    """True when matplotlib is on Agg (or any non-interactive backend)
+    so we cannot construct a real Qt5/OpenGL widget. The benchmark falls
+    back to a matplotlib-only single-axes figure in that case — same
+    halo overlay, no embedded 3D panel."""
+    if os.environ.get("MPLBACKEND", "").lower().startswith("agg"):
+        return True
+    return matplotlib.get_backend().lower().startswith("agg")
 
-    Left panel: terrain + multi-agent markers / paths / goals
-    Middle panel: BEV PCA-grade costmap (latest scans, color-coded by agent)
-    Right panel: 3D point cloud (Agent 1 only) — same code path as the GUI
-    """
-    # Local import — scripts/ is added to sys.path above so `sim_view`
-    # resolves to the helper module next to lidar_sim_gui.py.
-    import sim_view
 
-    handles = sim_view.build_three_panel_figure(
-        title="Ramp Crossing Test",
-        terrain_img=terrain_img,
-        terrain_extent=terrain_extent,
-        figsize=(22, 11),
-    )
-    fig = handles["fig"]
-    ax = handles["ax_map"]
-    ax_bev = handles["ax_bev"]
-    ax3d = handles["ax3d"]
-    bev_handle = handles["bev_handle"]
-    status = handles["status"]
-
-    # The benchmark map covers a larger area than the GUI (VIEW_HALF=6 vs 8).
+def _decorate_map_axes(ax, agents, fig):
+    """Add the benchmark's per-agent markers / paths / goals / trails,
+    ramp zone rectangles, agent-color legend, and figure suptitle on
+    top of a freshly-built ``ax_map``. Shared between the legacy
+    matplotlib-only ``_setup_figure`` path and the new Qt path so both
+    layouts look identical."""
     cm_view = VIEW_HALF
     ax.set_xlim(-cm_view, cm_view)
     ax.set_ylim(-cm_view, cm_view)
-    # Replace the default RGBA global overlay with one sized to the
-    # benchmark's view extent. The shared figure's global_img imshow
-    # is sized [-8, 8] which is fine for the GUI but cropped for us.
-    handles["global_img"].set_extent([-cm_view, cm_view, -cm_view, cm_view])
 
     # Per-agent map markers / goals / paths / traveled trails.
     # Marker SHAPES + sizes mirror the GUI conventions:
     #   filled circle s=10 (agent), star s=18 alpha=0.5 (goal),
     #   dashed lw=1.5 alpha=0.4 (planned path),
     #   solid  lw=2.5 alpha=0.8 (traveled trail).
-    # The per-agent COLOR remains so 15 agents are distinguishable.
     markers, goal_mks, path_lines, trav_lines = [], [], [], []
     for a in agents:
         mk, = ax.plot([], [], "o", color=a.color, markersize=10, zorder=10)
@@ -745,7 +731,6 @@ def _setup_figure(agents, terrain_img=None, terrain_extent=None):
                 ha="center", va="top", fontsize=9,
                 color=COLORS[r["id"] - 1], alpha=0.7)
 
-    # Per-agent color legend on the map panel.
     legend_handles = [
         Patch(facecolor=c, label=f"R{r['id']} ({r['slope']}d)")
         for c, r in zip(COLORS, RAMPS)]
@@ -757,29 +742,179 @@ def _setup_figure(agents, terrain_img=None, terrain_extent=None):
                  color="white", fontsize=16, fontweight="bold", y=0.98)
     ax.set_title("", color="white", fontsize=14, fontweight="bold")
 
+    return markers, goal_mks, path_lines, trav_lines
+
+
+def _setup_figure_qt(agents, mesh, terrain_img=None, terrain_extent=None,
+                     headless=False):
+    """Build the benchmark visualization, mirroring the single-agent GUI.
+
+    Layout (interactive Qt5Agg):
+      Left  — matplotlib FigureCanvasQTAgg (terrain + per-agent markers/
+               paths/trails/goals + UNION-of-all-agents persistent
+               obstacle halo via ``GlobalCostmap.render_overlay``-style
+               smooth-alpha red fade)
+      Right — PyQtGraph GLViewWidget (Agent 1's 3D point cloud + ghost STL)
+
+    Layout (headless Agg, ``headless=True``):
+      Single matplotlib figure with the same map axes; the GL panel is
+      replaced with a ``MockThreeDView`` so ``update_3d_panel`` calls
+      remain no-ops. The gif export captures just the map (no 3D panel
+      embedded) — the halo overlay carries the obstacle picture.
+
+    Returns the same 9-tuple shape ``_setup_figure`` did so the rest of
+    the benchmark plumbing stays unchanged.
+    """
+    import sim_view
+
+    if headless:
+        # Matplotlib-only fallback. Single ax_map with a halo overlay
+        # imshow, sized to the persistent GlobalCostmap extent so the
+        # overlay's natural extent matches.
+        fig = plt.figure(figsize=(11, 11), facecolor="#1e1e1e")
+        try:
+            fig.canvas.manager.set_window_title("Ramp Crossing Test")
+        except Exception:
+            pass
+        ax = fig.add_subplot(1, 1, 1)
+        ax.set_facecolor("#222")
+        if terrain_img is not None and terrain_extent is not None:
+            ax.imshow(terrain_img, origin="lower", extent=terrain_extent,
+                      cmap="gray", aspect="equal", vmin=0, vmax=1)
+        global_img = ax.imshow(
+            np.zeros((10, 10, 4), dtype=np.uint8),
+            origin="lower",
+            extent=[-sim.GLOBAL_HALF, sim.GLOBAL_HALF,
+                    -sim.GLOBAL_HALF, sim.GLOBAL_HALF],
+            aspect="equal", alpha=0.85, zorder=3,
+            interpolation="none")
+        ax.set_xlabel("X (m)", color="white")
+        ax.set_ylabel("Y (m)", color="white")
+        ax.tick_params(colors="white")
+        ax.grid(False, which="both")
+        ax.minorticks_off()
+        for s in ax.spines.values():
+            s.set_edgecolor("#555")
+        status = fig.text(0.5, 0.01, "", ha="center", fontsize=10,
+                          color="white", style="italic")
+
+        three_d_view = sim_view.MockThreeDView()
+        container = None
+    else:
+        handles = sim_view.build_three_panel_qt_widget(
+            title="Ramp Crossing Test",
+            terrain_img=terrain_img,
+            terrain_extent=terrain_extent,
+            figsize=(11, 11),
+            ghost_mesh=mesh,
+        )
+        fig = handles["fig"]
+        ax = handles["ax_map"]
+        global_img = handles["global_img"]
+        status = handles["status"]
+        three_d_view = handles["three_d"]
+        container = handles["widget"]
+
+    # The persistent GlobalCostmap covers ±GLOBAL_HALF (=10 m) so the
+    # halo overlay's extent stays at its native size; the map's xlim/
+    # ylim of ±VIEW_HALF crops the visible region to the interesting bit.
+    global_img.set_extent([-sim.GLOBAL_HALF, sim.GLOBAL_HALF,
+                           -sim.GLOBAL_HALF, sim.GLOBAL_HALF])
+
+    markers, goal_mks, path_lines, trav_lines = _decorate_map_axes(
+        ax, agents, fig)
+
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
 
-    # Bundle so _update_viz can reach every artist it needs.
+    # Bundle every artist + 3D handle the update loop needs. ``ax_bev``
+    # / ``ax3d`` / ``bev_handle`` are kept as None for back-compat with
+    # callers that probe them; the new pipeline doesn't touch them.
+    viz = {
+        "ax_map": ax,
+        "ax_bev": None,
+        "ax3d": None,
+        "global_img": global_img,
+        "bev_handle": None,
+        "three_d": three_d_view,
+        "3d_state": None,           # GL path doesn't need ThreeDState
+        "markers": markers,
+        "goal_mks": goal_mks,
+        "path_lines": path_lines,
+        "trav_lines": trav_lines,
+        "status": status,
+        # Blit state — populated lazily on first ``_update_viz`` call so
+        # the static terrain bg is snapshotted *after* the figure has
+        # been shown / sized.
+        "blit_bg": None,
+        "container": container,
+        "headless": headless,
+    }
+    return (fig, ax, markers, goal_mks, path_lines, trav_lines,
+            status, global_img, viz)
+
+
+def _setup_figure(agents, terrain_img=None, terrain_extent=None):
+    """Legacy 3-panel matplotlib figure (mplot3d + BEV + map).
+
+    Retained as a fallback for any caller that explicitly wants the
+    pre-port look; the active main() uses ``_setup_figure_qt`` for both
+    Qt5Agg and Agg paths so the GUI + benchmark share the same render
+    system.
+    """
+    import sim_view
+
+    handles = sim_view.build_three_panel_figure(
+        title="Ramp Crossing Test",
+        terrain_img=terrain_img,
+        terrain_extent=terrain_extent,
+        figsize=(22, 11),
+    )
+    fig = handles["fig"]
+    ax = handles["ax_map"]
+    ax_bev = handles["ax_bev"]
+    ax3d = handles["ax3d"]
+    bev_handle = handles["bev_handle"]
+    status = handles["status"]
+
+    cm_view = VIEW_HALF
+    handles["global_img"].set_extent([-cm_view, cm_view, -cm_view, cm_view])
+
+    markers, goal_mks, path_lines, trav_lines = _decorate_map_axes(
+        ax, agents, fig)
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+
     viz = {
         "ax_map": ax,
         "ax_bev": ax_bev,
         "ax3d": ax3d,
         "global_img": handles["global_img"],
         "bev_handle": bev_handle,
+        "three_d": None,
         "3d_state": sim_view.ThreeDState(),
+        "markers": markers,
+        "goal_mks": goal_mks,
+        "path_lines": path_lines,
+        "trav_lines": trav_lines,
+        "status": status,
+        "blit_bg": None,
+        "container": None,
+        "headless": True,
+        "legacy_mpl3d": True,
     }
     return (fig, ax, markers, goal_mks, path_lines, trav_lines,
             status, handles["global_img"], viz)
 
 
 def _render_costmap_overlay(agents, size=400):
-    """Composite all agents' global costmaps into an RGBA overlay.
-    Each agent's obstacles get its color.  Platform-bound obstacles
-    (outside the navigable area) are excluded so only LiDAR-detected
-    obstacles are visible."""
+    """Per-agent dot overlay (LEGACY — kept for `_setup_figure` fallback).
+
+    The active rendering path is ``_render_halo_overlay`` below, which
+    matches the single-agent GUI's smooth-fade red halo. This dot-color
+    overlay is only used by the legacy 3-panel mpl3d setup, which the
+    main flow no longer takes."""
     img = np.zeros((size, size, 4), dtype=np.uint8)
     view = float(VIEW_HALF)
-    # Rule 3: no platform bounds — render all obstacles
     for a in agents:
         cm = a.costmap
         if not cm.obstacles.any():
@@ -796,9 +931,58 @@ def _render_costmap_overlay(agents, size=400):
     return img
 
 
+def _render_halo_overlay(agents):
+    """Smooth-alpha red halo over the UNION of all agents' obstacles.
+
+    Mirrors ``GlobalCostmap.render_overlay`` in the single-agent GUI:
+    one ``distance_transform_edt`` on the merged 400×400 obstacle grid,
+    then a per-cell weight from 1.0 at the inscribed band down to 0.0
+    at the inflation edge. Output is an RGBA uint8 image at the same
+    cell pitch as ``GlobalCostmap`` so the imshow's native extent
+    [-GLOBAL_HALF, GLOBAL_HALF] aligns 1:1 with the costmap cells.
+
+    Cheap: a single distance transform + a few vectorized array ops.
+    """
+    # Use the first agent's costmap as the geometry reference. All
+    # agents share GLOBAL_RES / GLOBAL_HALF so their grids are
+    # identical-shape and OR'ing them is a per-cell bitwise-or.
+    if not agents:
+        return np.zeros((1, 1, 4), dtype=np.uint8)
+    cm0 = agents[0].costmap
+    h, w = cm0.h, cm0.w
+    union = np.zeros((h, w), dtype=bool)
+    for a in agents:
+        union |= a.costmap.obstacles
+    img = np.zeros((h, w, 4), dtype=np.uint8)
+    if not union.any():
+        return img
+    cell_dist = distance_transform_edt(~union)
+    infl_cells_outer = (sim.ROBOT_RADIUS + sim.INFLATION_RADIUS) / cm0.res
+    infl_cells_inner = sim.ROBOT_RADIUS / cm0.res
+    in_halo = cell_dist <= infl_cells_outer
+    denom = max(infl_cells_outer - infl_cells_inner, 1e-3)
+    weight = np.clip(
+        (infl_cells_outer - cell_dist) / denom, 0.0, 1.0
+    ).astype(np.float32)
+    alpha = (weight * in_halo).astype(np.float32)
+    img[..., 0] = 220
+    img[..., 1] = 30
+    img[..., 2] = 30
+    img[..., 3] = (alpha * 220).astype(np.uint8)
+    return img
+
+
 def _update_viz(agents, markers, goal_mks, path_lines, trav_lines,
                 status, phase, costmap_overlay=None, viz=None):
-    """Refresh every artist in the three-panel figure."""
+    """Refresh every artist in the benchmark figure.
+
+    Uses matplotlib blit on the map axes (mirrors the GUI's _animate):
+    snapshot the static terrain bg once, then per-frame restore the bg
+    and ``draw_artist`` the halo overlay + 15 markers + 15 path lines +
+    15 trails + 15 goal stars + status text + canvas.blit(ax_map.bbox).
+    The 3D panel is updated via ``sim_view.update_3d_panel`` which
+    dispatches on the view type (real GL widget or mock no-op).
+    """
     import sim_view
     parts = []
     for i, a in enumerate(agents):
@@ -822,38 +1006,171 @@ def _update_viz(agents, markers, goal_mks, path_lines, trav_lines,
                else "?")
         parts.append(f"R{a.id}:{tag}")
     status.set_text(f"{phase}  |  " + "  |  ".join(parts))
-    if costmap_overlay is not None:
-        costmap_overlay.set_data(_render_costmap_overlay(agents))
 
     if viz is None:
+        # Pure legacy path — no halo, no 3D, just the old dot overlay.
+        if costmap_overlay is not None:
+            costmap_overlay.set_data(_render_costmap_overlay(agents))
         return
-    # ── Middle panel: BEV showing every agent's latest local scan,
-    # color-coded by agent. Uses the shared sim_view helper. ──
-    agents_obs = [(a.last_scan_obs, a.color) for a in agents]
-    viz["bev_handle"].set_data(
-        sim_view.render_bev_multi(agents_obs))
 
-    # ── Right panel: 3D point cloud for Agent 1 — exact same code
-    # path as the GUI's _update_3d (sim_view.update_3d_panel). ──
+    # ── Halo overlay (union of every agent's persistent obstacles) ──
+    # Mirrors the single-agent GUI's GlobalCostmap.render_overlay output
+    # so both front-ends share the same look.
+    halo = _render_halo_overlay(agents)
+    viz["global_img"].set_data(halo)
+
+    # Legacy mpl3d path still writes a BEV panel + matplotlib 3D scatter.
+    if viz.get("legacy_mpl3d"):
+        if costmap_overlay is not None:
+            costmap_overlay.set_data(_render_costmap_overlay(agents))
+        if viz.get("bev_handle") is not None:
+            agents_obs = [(a.last_scan_obs, a.color) for a in agents]
+            viz["bev_handle"].set_data(
+                sim_view.render_bev_multi(agents_obs))
+        a1 = agents[0]
+        if (viz.get("ax3d") is not None
+                and a1.last_scan_cloud is not None
+                and a1.last_scan_origin is not None
+                and a1.last_scan_slope_grid is not None
+                and a1.last_scan_obs is not None):
+            sim_view.update_3d_panel(
+                viz["ax3d"], viz["3d_state"],
+                a1.last_scan_cloud, a1.last_scan_origin,
+                a1.last_scan_sn, a1.last_scan_slope_grid,
+                a1.last_scan_obs)
+        return
+
+    # ── 3D panel: Agent 1's latest scan, GL fast-path or mock no-op ──
+    three_d_view = viz.get("three_d")
     a1 = agents[0]
-    if (a1.last_scan_cloud is not None
+    if (three_d_view is not None
+            and a1.last_scan_cloud is not None
             and a1.last_scan_origin is not None
             and a1.last_scan_slope_grid is not None
             and a1.last_scan_obs is not None):
         sim_view.update_3d_panel(
-            viz["ax3d"], viz["3d_state"],
+            three_d_view, None,
             a1.last_scan_cloud, a1.last_scan_origin,
             a1.last_scan_sn, a1.last_scan_slope_grid,
             a1.last_scan_obs)
 
 
+def _blit_map_axes(viz):
+    """Blit the map axes: restore the cached terrain bg, draw_artist
+    every dynamic artist (halo + per-agent markers/paths/trails/goals
+    + status), and canvas.blit(ax_map.bbox). Replaces the per-frame
+    ``fig.canvas.draw()`` that was ~50-100 ms with a ~3-8 ms blit.
+
+    Falls back to ``canvas.draw_idle()`` if the bg snapshot is missing
+    (first call) or the blit machinery isn't available on this backend.
+    """
+    if viz is None:
+        return False
+    ax = viz["ax_map"]
+    fig = ax.figure
+    canvas = fig.canvas
+    bg = viz.get("blit_bg")
+
+    # Lazily snapshot the static bg the first time we're called. The
+    # halo + markers + paths + trails + goals + status are all flagged
+    # animated so they aren't baked into the snapshot.
+    if bg is None:
+        # Mark every per-frame artist as animated *before* we snapshot
+        # the bg so the snapshot only contains the static terrain.
+        viz["global_img"].set_animated(True)
+        for m in viz["markers"]:
+            m.set_animated(True)
+        for m in viz["goal_mks"]:
+            m.set_animated(True)
+        for m in viz["path_lines"]:
+            m.set_animated(True)
+        for m in viz["trav_lines"]:
+            m.set_animated(True)
+        if viz.get("status") is not None:
+            viz["status"].set_animated(True)
+        ax.grid(False, which="both")
+        try:
+            canvas.draw()
+            bg = canvas.copy_from_bbox(ax.bbox)
+            viz["blit_bg"] = bg
+        except Exception:
+            return False
+
+    try:
+        canvas.restore_region(bg)
+        if viz["global_img"].get_visible():
+            ax.draw_artist(viz["global_img"])
+        for m in viz["trav_lines"]:
+            if m.get_visible():
+                ax.draw_artist(m)
+        for m in viz["path_lines"]:
+            if m.get_visible():
+                ax.draw_artist(m)
+        for m in viz["goal_mks"]:
+            if m.get_visible():
+                ax.draw_artist(m)
+        for m in viz["markers"]:
+            if m.get_visible():
+                ax.draw_artist(m)
+        # Status text lives on the figure, not the map axes — drawing
+        # it via figure-level blit would require a separate bg snapshot;
+        # cheap-out is to skip it from the blit path and let the next
+        # full draw (e.g. _grab_frame) repaint it.
+        canvas.blit(ax.bbox)
+        return True
+    except Exception:
+        return False
+
+
 # ── Phase runner ───────────────────────────────────────────────────
 
-def _grab_frame(fig):
-    """Rasterize current figure to an RGB numpy array."""
+def _grab_frame(fig, viz=None):
+    """Rasterize current figure to an RGB numpy array.
+
+    ``fig.canvas.draw()`` is the dominant cost on the benchmark's old
+    visualization path (~50-100 ms / frame on a 22x11 figure). We still
+    need a full draw before grabbing the gif frame so all the artists
+    are present in the rasterized output — there's no cheap way to
+    blit a buffer directly to memory while keeping the static terrain.
+    The blit fast-path in ``_blit_map_axes`` is reserved for the live
+    on-screen frames; only the every-10th gif-capture frame pays the
+    full-draw cost.
+
+    Calling ``canvas.draw()`` invalidates the cached blit bg (the
+    underlying renderer state changes), so we drop ``viz["blit_bg"]``
+    here and let ``_blit_map_axes`` re-snapshot on the next call.
+    """
+    # Temporarily un-animate so the full draw paints every artist into
+    # the canvas buffer (animated artists are otherwise skipped by the
+    # draw pass and would only appear after a separate draw_artist +
+    # blit). We restore the animated flags after grabbing the frame.
+    restored = []
+    if viz is not None:
+        for key in ("global_img",):
+            art = viz.get(key)
+            if art is not None and art.get_animated():
+                art.set_animated(False)
+                restored.append(art)
+        for key in ("markers", "goal_mks", "path_lines", "trav_lines"):
+            for art in viz.get(key, []) or []:
+                if art.get_animated():
+                    art.set_animated(False)
+                    restored.append(art)
+        status = viz.get("status")
+        if status is not None and status.get_animated():
+            status.set_animated(False)
+            restored.append(status)
     fig.canvas.draw()
     buf = fig.canvas.buffer_rgba()
-    return np.asarray(buf)[:, :, :3].copy()
+    frame = np.asarray(buf)[:, :, :3].copy()
+    # Re-animate for the next blit cycle, and invalidate the cached bg
+    # because canvas.draw() repopulated the renderer with the animated
+    # artists baked into the buffer.
+    for art in restored:
+        art.set_animated(True)
+    if viz is not None:
+        viz["blit_bg"] = None
+    return frame
 
 
 def run_phase(agents, fig, ax, markers, goal_mks, path_lines,
@@ -888,7 +1205,7 @@ def run_phase(agents, fig, ax, markers, goal_mks, path_lines,
     _update_viz(agents, markers, goal_mks, path_lines, trav_lines,
                 status, phase_name, costmap_overlay, viz)
     fig.canvas.draw()
-    frames.append(_grab_frame(fig))
+    frames.append(_grab_frame(fig, viz))
 
     for step in range(MAX_STEPS):
         all_done = True
@@ -946,21 +1263,31 @@ def run_phase(agents, fig, ax, markers, goal_mks, path_lines,
                 print(f"  Agent {a.id}: ARRIVED at "
                       f"({a.pos[0]:.1f}, {a.pos[1]:.1f})")
 
-        # Capture every 10th step. Held in RAM until GIF write — the
-        # full figure buffer is ~10 MB per frame, so 994 frames at
-        # step%5 OOM'd the WSL Python process during PIL save_all.
-        if step % 10 == 0 or all_done:
-            _update_viz(agents, markers, goal_mks, path_lines, trav_lines,
-                        status, phase_name, costmap_overlay, viz)
+        # Every step: blit-only refresh of the live window (cheap —
+        # restores the cached terrain bg + draw_artist on the animated
+        # artists). Headless gif export captures every 10th step via
+        # a full ``canvas.draw()`` + ``_grab_frame``; in LIVE Qt mode
+        # that full draw causes a visible flash on screen, so we skip
+        # capture there. The gif is the benchmark's batch-mode output,
+        # not the interactive view, so it's safe to gate.
+        _update_viz(agents, markers, goal_mks, path_lines, trav_lines,
+                    status, phase_name, costmap_overlay, viz)
+        capture = viz.get("headless", False) and ((step % 10 == 0) or all_done)
+        if capture:
             fig.canvas.draw()
-            frames.append(_grab_frame(fig))
-            # Pump the GUI event loop so the live window stays responsive
-            # under Qt5Agg. No-op cost under Agg.
-            try:
-                fig.canvas.flush_events()
-                plt.pause(0.001)
-            except Exception:
-                pass
+            frames.append(_grab_frame(fig, viz))
+        else:
+            # Blit fast-path on the map axes. Falls back to draw_idle()
+            # internally if the backend can't blit.
+            ok = _blit_map_axes(viz)
+            if not ok:
+                fig.canvas.draw_idle()
+        # Pump the GUI event loop so the live Qt window stays responsive.
+        # No-op cost under Agg.
+        try:
+            fig.canvas.flush_events()
+        except Exception:
+            pass
         if all_done:
             break
 
@@ -1067,12 +1394,34 @@ def main():
     # Mirrors what DualNavGUI does at startup so both front-ends look identical.
     terrain_img, terrain_extent = _build_terrain(mesh)
 
+    # Choose between the new Qt5Agg path (PyQtGraph 3D + single-axes
+    # matplotlib map with halo overlay, same render stack as the GUI)
+    # and the headless matplotlib-only fallback (MockThreeDView; gif
+    # captures the map axes only — no embedded 3D panel).
+    headless = _is_headless_backend()
     fig, ax, markers, goal_mks, plines, tlines, status, cm_overlay, viz = \
-        _setup_figure(agents, terrain_img=terrain_img,
-                       terrain_extent=terrain_extent)
-    # Pop the live window under Qt5Agg. Under Agg, show() is a no-op.
+        _setup_figure_qt(agents, mesh,
+                         terrain_img=terrain_img,
+                         terrain_extent=terrain_extent,
+                         headless=headless)
     plt.ion()
-    plt.show(block=False)
+    if headless:
+        # Under Agg, show() is a no-op but harmless. The capture comes
+        # from canvas.buffer_rgba() inside _grab_frame.
+        try:
+            plt.show(block=False)
+        except Exception:
+            pass
+    else:
+        # Qt path: pop the embedded matplotlib+GL container window.
+        # plt.show() would only surface the mpl canvas's stand-alone
+        # manager (without the GL view), so we drive the container
+        # directly. The Qt event loop is pumped via canvas.flush_events()
+        # inside run_phase — no app.exec_() here.
+        container = viz.get("container")
+        if container is not None:
+            container.resize(1400, 800)
+            container.show()
 
     frames = []
 
