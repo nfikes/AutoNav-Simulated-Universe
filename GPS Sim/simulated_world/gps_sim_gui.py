@@ -66,6 +66,22 @@ from matplotlib.collections import LineCollection
 from scipy.ndimage import distance_transform_edt
 
 
+# ── Three-waypoint mission (chained + cached) ─────────────────────
+# Canonical 3 GPS waypoints from the deployed
+# ``isaac_ros-dev/config/stored_waypoints.txt`` (the actual surveyed
+# competition fixture). When ``--mission three-waypoint`` is passed,
+# the sim runs these three GPS targets in order while preserving EKF
+# state (the "preemptive next-goal cache") across leg switches —
+# mirroring ``gps_handler_node.py`` on branch
+# ``origin/improve/gps-waypoint-continuity``. Each tuple is
+# (latitude_deg, longitude_deg).
+THREE_WAYPOINT_MISSION = [
+    (37.23027, -80.42504),
+    (37.23013, -80.42524),
+    (37.22999, -80.42507),
+]
+
+
 # ── Map geometry ──────────────────────────────────────────────────
 LAT_CENTER = 37.23027
 LON_CENTER = -80.42504
@@ -74,7 +90,11 @@ MAP_M      = MAP_FT * 0.3048      # 152.4 m
 MAP_HALF   = MAP_M / 2.0          # 76.2 m
 RES        = 0.5                  # 0.5 m grid → 305x305 cells
 
-EARTH_R    = 6378137.0            # WGS-84 equatorial radius (m)
+EARTH_R    = 6_371_000.0          # mean Earth radius (m); matches
+                                  # gps_conversions.py EARTH_R_M on the
+                                  # deployed robot side so the sim's
+                                  # lat/lon ↔ local conversion is
+                                  # byte-equivalent to production.
 
 # ── Robot / planner constants ────────────────────────────────────
 ROBOT_RADIUS     = 0.30
@@ -233,12 +253,13 @@ LIDAR_IMU_NOISE_STD_RAD_PER_S = 0.01
 # ``--real`` matches the deployed stack.
 LIDAR_IMU_FUSION_ENABLE      = False
 
-# How many physics ticks the GUI runs per timer fire. The timer still
-# fires at 10 Hz (so matplotlib redraws ~10×/s), but each fire steps
-# the world STEPS_PER_FRAME ticks. Effect: 30 sim-seconds per 10
-# wallclock-seconds at the default value, without raising agent
-# velocity (which causes overshoot into obstacles).
-STEPS_PER_FRAME = 3
+# How many physics ticks the GUI runs per timer fire. The render
+# timer fires at 30 Hz (GUI_FPS below), so each fire steps one
+# physics tick — gives smooth ~30 FPS motion at the same sim-time
+# rate the old 10-FPS / 3-step combo produced (3 sim-s / 1 wall-s).
+STEPS_PER_FRAME = 1
+GUI_FPS = 30
+GUI_FRAME_DT_MS = int(1000 / GUI_FPS)
 LOOKAHEAD     = 1.5                          # path lookahead (m)
 SPEED_GAIN    = 1.0                          # slows near goal (1/s)
 MIN_SEARCH_SPEED = 0.4                       # m/s — keep moving even
@@ -387,9 +408,11 @@ EKF_POS_VAR_FLOOR = 1.0 ** 2                 # σ ≥ 1.0 m
 # EKF's θ by more than the threshold, snap θ to the closed-form value
 # and re-widen θ_var so the EKF keeps refining. Cooldown gates how
 # often this can fire to avoid thrashing.
-HEADING_RESYNC_THRESHOLD_DEG  = 10.0
+HEADING_RESYNC_THRESHOLD_DEG  = 15.0   # May-2026 retune (was 10) —
+                                        # matches deployed
+                                        # gps_handler_node anti-chatter
 HEADING_RESYNC_MIN_BASELINE_M = 2.0
-HEADING_RESYNC_COOLDOWN_S     = 3.0
+HEADING_RESYNC_COOLDOWN_S     = 5.0    # May-2026 retune (was 3)
 HEADING_RESYNC_WINDOW         = 100   # GPS samples (≈ 10 s @ 10 Hz)
 # Reject GPS-vs-odom pairs from the heading fit when the magnitudes
 # disagree by more than this factor. Spoofers pin GPS while odom
@@ -492,6 +515,23 @@ REPLAN_GOAL_DRIFT_M    = 3.0
 # deployment — internal belief stays high-res, commitment stays
 # realistic. Override per-run with --nav2-hz.
 NAV2_GOAL_HZ           = 1.0
+# ── Stop-refining / heartbeat gates (real-robot parity) ───────────
+# Mirrors gps_handler_node.py:
+#   STOP_REFINE_K · STOP_REFINE_SIGMA_GPS_M = 0.6 m = the "we're
+#     close enough — stop nudging the goal" bubble around the true
+#     goal. Once the EKF position falls inside the bubble we freeze
+#     `published_goal_world` so the controller / planner don't keep
+#     chasing sub-σ wobble (which on the real robot triggers
+#     bt_navigator replans and a visible start-stop pattern).
+#   GOAL_REPUBLISH_HEARTBEAT_S — minimum interval between successive
+#     /goal_pose republishes. Deployed-value parity (0.2 s on the
+#     real node — keeps the action chain warm without flooding it).
+#   GOAL_POSE_HEARTBEAT_S — lifecycle heartbeat: re-issue the goal
+#     after this long even if nothing has changed (60 s).
+STOP_REFINE_K              = 2.0
+STOP_REFINE_SIGMA_GPS_M    = 0.3
+GOAL_POSE_HEARTBEAT_S      = 60.0
+GOAL_REPUBLISH_HEARTBEAT_S = 0.2
 # During bootstrap the candidate goal can swing wildly; use a looser
 # threshold so we don't burn A* on each tiny rotation, but still allow
 # replan when the goal has moved by more than ~one path length. This is
@@ -511,7 +551,8 @@ REPLAN_MIN_INTERVAL_S  = 0.5
 # small-step time constant is ~0.6 s; with SNAP = 5 m the bootstrap
 # → resync drop snaps through immediately.
 CANDIDATE_SMOOTH_ALPHA = 0.15
-CANDIDATE_SNAP_M       = 5.0
+CANDIDATE_SNAP_M       = 10.0    # May-2026 retune (was 5) — matches
+                                  # deployed gps_handler_node
 
 # Theoretical-envelope outlier filter on the candidate goal.
 #
@@ -532,7 +573,8 @@ CANDIDATE_SNAP_M       = 5.0
 # the envelope is huge anyway, and we don't want to gate the
 # legitimate snap that resyncs the heading).
 CANDIDATE_ENV_GAIN_M    = 0.5    # ≈ σ_GPS lateral noise, metres
-CANDIDATE_ENV_FLOOR_M   = 0.4    # noise floor (irreducible)
+CANDIDATE_ENV_FLOOR_M   = 1.0    # noise floor (irreducible). May-2026
+                                  # retune (was 0.4) — matches deployed
 CANDIDATE_ENV_REJECT_K  = 4.0    # reject if d_raw > K · d_env
                                  # (was 3.0; loosened to let more
                                  # legitimate corrections through —
@@ -1277,6 +1319,44 @@ class GPSEKF:
         self.P[:, 2] = 0.0
         self.P[2, 2] = float(theta_var)
 
+    def update_theta_measurement(self, theta_obs, theta_meas_std):
+        """Scalar Kalman update on θ as a direct measurement.
+
+        Real-robot parity, mirrored from gps_ekf.GpsEkf.update_theta_measurement
+        (gps_ekf.py lines 198-232).
+
+        Use this AFTER bootstrap completes, where we want successive
+        observations weighed against the EKF's accumulated confidence
+        rather than snap-replacing it. As P[2,2] shrinks across many
+        updates the Kalman gain on the next observation also shrinks,
+        so a converged θ becomes increasingly resistant to single
+        noisy fits. This is what makes the candidate goal in map
+        frame actually converge instead of swinging on every resync
+        event.
+
+        Measurement model: H = [0, 0, 1], R = theta_meas_std². The
+        gain K = P[:, 2] / (P[2,2] + R) is a 3-vector — the
+        accumulated cross-covariance entries propagate information
+        from the θ observation into x and y too.
+        """
+        R_theta = float(theta_meas_std) ** 2
+        innovation = (float(theta_obs) - self.x[2] + math.pi) \
+                     % (2 * math.pi) - math.pi
+        S = float(self.P[2, 2]) + R_theta
+        if S <= 0.0:
+            return False
+        K = self.P[:, 2] / S
+        self.x[0] += K[0] * innovation
+        self.x[1] += K[1] * innovation
+        self.x[2] = (self.x[2] + K[2] * innovation + math.pi) \
+                    % (2 * math.pi) - math.pi
+        # H = [0,0,1] selects row 2: (I - K H) P  ≡  P - outer(K, P[2,:]).
+        self.P = self.P - np.outer(K, self.P[2, :])
+        # Re-symmetrize for numerical safety.
+        self.P = 0.5 * (self.P + self.P.T)
+        self.update_count += 1
+        return True
+
     def update(self, zx, zy, gate_chi2=EKF_GATE_CHI2):
         z = np.array([zx, zy], dtype=float)
         H = np.array([[1.0, 0.0, 0.0],
@@ -1388,6 +1468,11 @@ class AgentSelfView:
     path_len: int
     best_i: int
     last_pad_m: float
+    # Real-robot parity: STOP_REFINE bubble latched on first entry.
+    # True once the EKF position has fallen inside the
+    # STOP_REFINE_K · STOP_REFINE_SIGMA bubble around the true goal
+    # (post-latch, `published_goal_world` no longer updates).
+    refinement_locked: bool
 
 
 @dataclass
@@ -1440,6 +1525,7 @@ class AgentDebugView:
             f"    ekf_theta       {s.ekf_theta_deg:+.2f}° "
             f"(σ={s.ekf_theta_std_deg:.2f}°)\n"
             f"    bootstrap_done  {s.bootstrap_done}\n"
+            f"    refine_locked   {s.refinement_locked}\n"
             f"    candidate_goal  {_xy(s.candidate_goal_world)}\n"
             f"    path            len={s.path_len}  best_i={s.best_i}  "
             f"last_pad={s.last_pad_m:.1f} m\n"
@@ -1551,12 +1637,36 @@ class GPSWaypointSim:
     def __init__(self, costmap, start_world, true_heading_rad,
                  goal_world, rng, roofs=(), projectors=(),
                  jammers=(), foliage=(), spoofers=(),
-                 odom_yaw_bias_rate=None):
+                 odom_yaw_bias_rate=None,
+                 goal_queue=None,
+                 coldstart_bias_enabled=False,
+                 next_hint_enabled=None):
         self.cm = costmap
         self.start_world  = tuple(start_world)
         self.true_heading = float(true_heading_rad)
         self.goal_world   = tuple(goal_world)
         self.rng = rng
+        # Chained-mission state. ``goal_queue`` is a list of remaining
+        # (lat_deg, lon_deg) tuples AFTER the current ``goal_world``;
+        # default ``None`` ⇒ single-goal mode (regression-safe).
+        # ``leg_index`` is 1-based and ``leg_count`` is the total
+        # number of legs (1 in single-goal mode). Mirrors the
+        # multi-leg progression on the deployed
+        # ``origin/improve/gps-waypoint-continuity`` branch where
+        # each new ``NavigateToWaypoint`` goal pops the next entry
+        # and the EKF / heading-fit state is *preserved* across the
+        # boundary (the "preemptive next-goal cache"), while a
+        # handful of per-leg baselines are reset.
+        self._goal_queue_init = list(goal_queue or [])
+        self.goal_queue = list(self._goal_queue_init)
+        self.leg_count  = 1 + len(self._goal_queue_init)
+        self.leg_index  = 1
+        # Steps elapsed since the most recent leg start. Reset to 0
+        # at ``_advance_to_next_leg`` so per-leg detectors that key
+        # off ``self.steps == N`` (e.g. the snapshot classifier)
+        # don't trip on stale counts from prior legs.
+        self._leg_start_step = 0
+        self._leg_start_sim_time = 0.0
         # Per-agent encoder yaw bias rate (rad of fictitious yaw
         # drift per meter of forward motion). Defaults to the
         # global calibration when ``ODOM_YAW_BIAS_ENABLE`` is
@@ -1695,11 +1805,81 @@ class GPSWaypointSim:
         # their published goals on the same wall-clock boundary
         # (which would look like a synchronized strobe in the GUI).
         self.published_goal_world = tuple(self.goal_world)
+        # Real-robot parity, mirrored from
+        # gps_handler_node._publish_goal (~line 1575). Once the EKF
+        # position falls inside the STOP_REFINE_K · STOP_REFINE_SIGMA
+        # bubble (0.6 m) around the true goal, freeze
+        # `published_goal_world` so the controller / planner don't
+        # chase sub-σ wobble. Latches True on first entry — does not
+        # re-arm even if the EKF drifts back outside.
+        self.refinement_locked = False
         # Low-pass filter on the candidate goal. Decoupled from EKF /
         # planner state so it can be tuned independently of those.
         # `None` means "not yet initialized — adopt the first raw
         # value verbatim". See `_update_candidate_smoother`.
         self._smoothed_candidate = None
+        # improve/gps-waypoint-continuity — shadow EWMA for the next
+        # queued GPS waypoint. Mirrors deployed
+        # ``gps_handler_node._next_hint_*`` state (deployed L584-591).
+        # Lives in parallel with ``_smoothed_candidate`` and is
+        # consulted only on a leg switch: if the cached hint's world
+        # xy matches the new leg's goal within
+        # ``_hint_match_tolerance_m``, the shadow EWMA's current
+        # value is promoted into ``_smoothed_candidate`` (warm
+        # start) — otherwise we cold-start as before. In single-goal
+        # mode (``goal_queue`` empty) the hint is never seeded and
+        # ``_next_hint_enabled`` stays False, keeping the
+        # single-goal headless smoke bit-identical.
+        #
+        # Optional CLI / kwarg override (matches deployed ROS
+        # parameter ``next_hint_enabled``, default False, see
+        # gps_handler_node.py L466 on
+        # ``origin/improve/gps-waypoint-continuity``). When the
+        # ``next_hint_enabled`` kwarg is None (the default), keep
+        # the auto-on-with-queue behavior so ``--mission three-
+        # waypoint`` continues to exercise the shadow EWMA without
+        # the caller having to also pass ``--next-hint-enable``.
+        # When the kwarg is explicitly True/False, that wins —
+        # documented inline so the launcher can force-on for a
+        # single-goal run, or force-off to A/B against the
+        # shadow-disabled baseline.
+        if next_hint_enabled is None:
+            self._next_hint_enabled = bool(self._goal_queue_init)
+        else:
+            self._next_hint_enabled = (
+                bool(next_hint_enabled)
+                or bool(self._goal_queue_init))
+        self._hint_match_tolerance_m = 0.5
+        self._next_hint_lat_lon = None
+        self._next_hint_world_xy = None
+        self._next_hint_smoothed_candidate = None
+        # improve/gps-waypoint-continuity — one-shot guard for the
+        # cold-start θ_offset seed. Deployed handler only snaps the
+        # EKF θ on the very FIRST GPS goal of the node's lifetime
+        # (deployed L526); subsequent legs reuse the already-
+        # bootstrapped θ. Sim doesn't currently grow a θ seed of
+        # its own — this flag is here so any future seed path
+        # respects the first-leg-only contract by default.
+        self._coldstart_theta_seeded = False
+        # CLI / kwarg toggle (matches deployed ROS parameter
+        # ``coldstart_bias_enabled``, default False, see
+        # gps_handler_node.py L481). Currently a wired stub: the
+        # sim has no equivalent of ``_seed_coldstart_theta_if_needed``
+        # because its EKF starts with theta_var0 = π² and the first
+        # GPS update already produces a near-unity Kalman gain on θ.
+        # TODO: if a real seed path is added (e.g. force-snap EKF θ
+        # to the goal bearing on the very first leg only), gate it
+        # on ``self._coldstart_bias_enabled`` and clear
+        # ``self._coldstart_theta_seeded`` on cancel-without-goal so
+        # the next valid leg picks up the snap. Field-parity contract
+        # only ever fires once per node lifetime.
+        self._coldstart_bias_enabled = bool(coldstart_bias_enabled)
+        # Counter incremented every time ``_advance_to_next_leg``
+        # actually promotes the shadow EWMA into the active
+        # smoother (i.e. the cached hint matched the new leg within
+        # tolerance). Surfaced as a sim-side observable so tests /
+        # debug prints can assert on chaining behaviour.
+        self._next_hint_warm_start_count = 0
         # Diagnostic counter — number of envelope-rejected candidates.
         self._cand_reject_count = 0
         # Stuck-detector state.
@@ -1789,12 +1969,23 @@ class GPSWaypointSim:
         self.sim_time = 0.0
         self._gps_acc_time = math.inf       # forces an immediate sample
 
-        # Bootstrap state. The EKF's linearization is unreliable while θ
-        # is wildly wrong, so we run a closed-form heading fit against
-        # GPS-vs-odom displacement until the robot has covered ~5 m. The
-        # EKF's θ state is forcibly replaced by the closed-form estimate
-        # during this phase; afterwards the EKF refines on its own.
-        self.bootstrap_done = False
+        # Bootstrap state. Unified design ported from deployed
+        # ``gps_handler_node`` on ``origin/improve/gps-waypoint-continuity``
+        # (L535-553): we run the EKF continuously from tick 1 with high
+        # initial θ variance (theta_var0 = π²) and let the first
+        # ``update_theta_measurement`` / standard GPS update produce a
+        # near-unity Kalman gain that effectively snaps θ on the first
+        # valid sample. The original two-state machine (explicit
+        # ``_bootstrap_theta`` + ``reset_theta`` + ``_adopt_K`` for the
+        # first ~5 m of motion, then graduate) caused field deadlocks:
+        # NAV2 wouldn't translate without a goal, the bootstrap couldn't
+        # fit without translation, robot sat stuck. Initializing
+        # ``bootstrap_done = True`` from __init__ makes the explicit
+        # bootstrap branch in ``step()`` (L3694-3734) unreachable —
+        # matching deployed's dead L871-branch — while keeping the
+        # ``_bootstrap_theta`` / ``_adopt_K`` helpers defined as harmless
+        # no-ops in case any out-of-band caller still hits them.
+        self.bootstrap_done = True
         self.bootstrap_min_travel = 5.0
 
         self.steps = 0
@@ -1839,6 +2030,40 @@ class GPSWaypointSim:
         if first is None:
             first = (self.true_pos[0], self.true_pos[1])
         self.ekf = GPSEKF(first[0], first[1])
+
+        # improve/gps-waypoint-continuity — seed the next-hint cache
+        # from the head of ``goal_queue`` so the shadow EWMA can
+        # converge during leg 1 and warm-start the leg-1→2 transition.
+        # No-op when the queue is empty (single-goal mode), keeping
+        # the headless smoke bit-identical. Mirrors what the
+        # deployed dispatcher does via the
+        # ``/gps_waypoint/next_hint`` topic before submitting the
+        # next ``NavigateToWaypoint`` action goal (deployed
+        # L457-465, L928-969).
+        self._seed_next_hint_from_queue()
+
+    def _seed_next_hint_from_queue(self):
+        """Project ``goal_queue[0]`` into world meters and stash it
+        as the active next-hint. Clears the shadow EWMA so it
+        re-converges from scratch against the new hint. Called once
+        from ``__init__`` and again at every ``_advance_to_next_leg``
+        AFTER the new leg's per-leg baselines are reset.
+
+        No-op when the queue is empty (last leg → no further hint)
+        or when ``_next_hint_enabled`` is False (single-goal
+        regression mode)."""
+        if not self._next_hint_enabled:
+            return
+        if not self.goal_queue:
+            # End of mission — clear any prior hint.
+            self._next_hint_lat_lon = None
+            self._next_hint_world_xy = None
+            self._next_hint_smoothed_candidate = None
+            return
+        next_lat, next_lon = self.goal_queue[0]
+        self._next_hint_lat_lon = (next_lat, next_lon)
+        self._next_hint_world_xy = latlon_to_meters(next_lat, next_lon)
+        self._next_hint_smoothed_candidate = None
 
     # -- GPS / belief ----------------------------------------------------
     def _gps_drift(self):
@@ -2287,14 +2512,21 @@ class GPSWaypointSim:
         diff = (bs_theta - self.ekf.theta + math.pi) % (2 * math.pi) \
                 - math.pi
         if abs(diff) > math.radians(HEADING_RESYNC_THRESHOLD_DEG):
-            # Snap θ AND adopt the freshly-fit K — both are needed
-            # for the next predict to integrate the right effective
-            # rotation. Without updating K_est here, the new θ
-            # would be inconsistent with the bias that's still
-            # accumulating in reported odom.
-            self.ekf.reset_theta(
+            # Real-robot parity, mirrored from
+            # gps_handler_node._maybe_resync_heading (lines ~1075-1079).
+            # Post-bootstrap we use a confidence-weighted Kalman update
+            # rather than a hard snap-replace: as P[2,2] shrinks the
+            # gain falls, so a converged θ becomes increasingly
+            # resistant to single noisy fits and the candidate goal in
+            # map frame actually converges instead of swinging on
+            # every resync. The bootstrap path retains reset_theta
+            # because there is no accumulated confidence to weigh
+            # against during cold start. We still update K_est here
+            # so the next predict integrates the right effective
+            # rotation (sim-only encoder-yaw-bias state).
+            self.ekf.update_theta_measurement(
                 bs_theta,
-                theta_var=math.radians(5.0) ** 2)
+                theta_meas_std=math.radians(5.0))
             self._adopt_K(bs_K)
             self._heading_resync_until = (
                 self.sim_time + HEADING_RESYNC_COOLDOWN_S)
@@ -2378,9 +2610,16 @@ class GPSWaypointSim:
                 % (2 * math.pi) - math.pi)
         if abs(diff) <= math.radians(PERIODIC_REFIT_THRESHOLD_DEG):
             return
-        self.ekf.reset_theta(
+        # Real-robot parity, mirrored from
+        # gps_handler_node._periodic_heading_refit (lines ~1118-1122).
+        # Same A/B as _maybe_resync_heading: Kalman update post-
+        # bootstrap so periodic refits respect accumulated confidence;
+        # the early-return at the top of this method already guards
+        # against the pre-bootstrap case (where reset_theta would be
+        # the right call).
+        self.ekf.update_theta_measurement(
             bs_theta,
-            theta_var=math.radians(PERIODIC_REFIT_VAR_DEG) ** 2)
+            theta_meas_std=math.radians(PERIODIC_REFIT_VAR_DEG))
         self._adopt_K(bs_K)
         self._heading_resync_count += 1
 
@@ -2532,6 +2771,7 @@ class GPSWaypointSim:
             path_len=path_len,
             best_i=self._best_i,
             last_pad_m=float(self.last_pad),
+            refinement_locked=bool(self.refinement_locked),
         )
         dist = math.hypot(self.true_pos[0] - self.goal_world[0],
                           self.true_pos[1] - self.goal_world[1])
@@ -2665,18 +2905,49 @@ class GPSWaypointSim:
         return (ox + dx_o, oy + dy_o)
 
     def intermediate_goal_world(self):
-        """Filtered candidate goal — what consumers (planner,
-        controller, viz) should target. Returns the EWMA-smoothed
-        version of `_compute_raw_candidate()`. The smoother runs once
-        per `step()` tick (see `_update_candidate_smoother`); calling
-        this between ticks is idempotent. Smoothing reduces the
-        multi-Hz wobble that comes from GPS-driven EKF position noise
-        scaled by the goal lever arm. Large-step events (heading
-        bootstrap → resync) bypass the EWMA via a step-detector so
-        the robot doesn't lag a real candidate-goal change."""
+        """Filtered candidate goal in WORLD frame — what consumers
+        (planner, controller, viz) should target. Returns the
+        EWMA-smoothed candidate, lifted from odom frame to world frame
+        via the EKF's belief about the odom↔world rotation
+        (``θ_ekf`` = ``heading_offset_est``). The smoother runs once
+        per ``step()`` tick (see ``_update_candidate_smoother``);
+        calling this between ticks is idempotent.
+
+        Frame plumbing (improve/gps-waypoint-continuity port — Fix 2):
+        ``self._smoothed_candidate`` is stored in odom frame (matches
+        deployed ``gps_handler_node._smoothed_candidate`` which is also
+        odom-frame; the deployed publisher transforms odom→map via TF
+        before publishing). In the sim there is no separate map frame;
+        the planner / A* / GUI all operate in WORLD frame. The
+        inverse of ``_compute_raw_candidate_odom_frame`` is:
+
+            candidate_world = ekf_pos + R(θ_ekf)·(smoothed_odom − odom_xy)
+
+        which collapses to the goal world when θ_ekf is converged AND
+        the EKF position tracks truth — i.e. as the EKF refines, the
+        published world-frame goal converges to ``self.goal_world``.
+        With imperfect θ_ekf the candidate is offset by the residual
+        heading error, exactly mirroring the deployed map-frame
+        candidate."""
         if self._smoothed_candidate is None:
+            # Cold start — return a world-frame raw candidate so
+            # downstream code never sees odom-frame coords during
+            # the first tick before the smoother latches.
             return self._compute_raw_candidate()
-        return self._smoothed_candidate
+        sx_o, sy_o = self._smoothed_candidate
+        ox, oy = self.odom[0], self.odom[1]
+        dox = sx_o - ox
+        doy = sy_o - oy
+        if self.ekf is not None:
+            theta = self.heading_offset_est  # = ekf.theta
+            ex, ey = self.ekf.pos_xy
+        else:
+            theta = 0.0
+            ex, ey = self.latest_gps()
+        c = math.cos(theta); s = math.sin(theta)
+        dwx = c * dox - s * doy
+        dwy = s * dox + c * doy
+        return (ex + dwx, ey + dwy)
 
     def _update_candidate_smoother(self):
         """Per-tick EWMA update with a 1/r-envelope outlier reject.
@@ -2693,8 +2964,20 @@ class GPSWaypointSim:
              pass through verbatim (heading resync, big A* re-target).
 
         The envelope is dormant for r < `CANDIDATE_ENV_MIN_R_M` so
-        the bootstrap → resync drop isn't gated."""
-        raw = self._compute_raw_candidate()
+        the bootstrap → resync drop isn't gated.
+
+        Truth-independence (improve/gps-waypoint-continuity port):
+        Feeds from ``_compute_raw_candidate_odom_frame`` — the
+        deployed-equivalent projection that uses only EKF state
+        (``ekf.pos_xy``, ``ekf.theta``) and ``self.odom``. The
+        world-frame helper ``_compute_raw_candidate`` is retained for
+        GUI / viz consumers but is no longer wired into the smoother
+        because it reads ``self.true_heading`` and would leak truth
+        into the convergence signal. Mirrors deployed
+        ``gps_handler_node._update_candidate_smoother`` (L1299-1309)
+        which calls ``self._compute_raw_candidate()`` → which itself
+        calls ``self._project_world_to_odom(active.goal_world_xy)``."""
+        raw = self._compute_raw_candidate_odom_frame()
 
         # ── envelope filter ──────────────────────────────────────
         # Suspend if the moving-away detector recently fired — the
@@ -2713,10 +2996,18 @@ class GPSWaypointSim:
                 else:
                     rx, ry = self.latest_gps()
                 gx, gy = self.goal_world
+                # Lever arm — frame-invariant under the rigid
+                # map↔odom transform; computed in world frame
+                # against the active goal (matches deployed
+                # ``_update_candidate_smoother`` L1320-1328).
                 lever = math.hypot(rx - gx, ry - gy)
                 d_env = max(CANDIDATE_ENV_FLOOR_M,
                             CANDIDATE_ENV_GAIN_M * lever / r)
-                d_raw = math.hypot(raw[0] - gx, raw[1] - gy)
+                # Compare ``raw`` (odom-frame) to the current
+                # smoothed candidate (also odom-frame) so the
+                # check stays in-frame. Mirrors deployed L1335-1336.
+                sx_prev, sy_prev = self._smoothed_candidate
+                d_raw = math.hypot(raw[0] - sx_prev, raw[1] - sy_prev)
                 if d_raw > CANDIDATE_ENV_REJECT_K * d_env:
                     self._cand_reject_count += 1
                     return  # drop this sample; keep last smoothed
@@ -2733,6 +3024,100 @@ class GPSWaypointSim:
         else:
             a = CANDIDATE_SMOOTH_ALPHA
             self._smoothed_candidate = (sx + a * dx, sy + a * dy)
+
+    def _compute_raw_next_hint_candidate(self):
+        """Raw candidate-goal projection targeted at
+        ``self._next_hint_world_xy`` instead of ``self.goal_world``.
+        Same rotation math as ``_compute_raw_candidate``; the only
+        difference is the target xy. Returns ``None`` when there's
+        no cached hint to project.
+
+        Truth-aware (uses ``self.true_heading``); kept for GUI / viz
+        consumers. Algorithmic consumers (the shadow EWMA in
+        ``_update_next_hint_smoother``) should call
+        ``_compute_raw_next_hint_candidate_odom_frame`` instead so
+        the smoothed value is computed from EKF state only — matching
+        deployed ``gps_handler_node._update_next_hint_smoother``
+        (L1269-1297) which calls
+        ``_project_world_to_odom(self._next_hint_world_xy)``.
+        """
+        if self._next_hint_world_xy is None:
+            return None
+        if not GPS_HEADING_EKF_ENABLE:
+            c = math.cos(self.true_heading)
+            s = math.sin(self.true_heading)
+            hx, hy = self._next_hint_world_xy
+            return (c * hx - s * hy, s * hx + c * hy)
+        if self.ekf is None:
+            ex, ey = self.latest_gps()
+        else:
+            ex, ey = self.ekf.pos_xy
+        vx = self._next_hint_world_xy[0] - ex
+        vy = self._next_hint_world_xy[1] - ey
+        dtheta = self.true_heading - self.heading_offset_est
+        c = math.cos(dtheta); s = math.sin(dtheta)
+        return (ex + c * vx - s * vy, ey + s * vx + c * vy)
+
+    def _compute_raw_next_hint_candidate_odom_frame(self):
+        """Odom-frame variant of ``_compute_raw_next_hint_candidate``.
+        Mirrors deployed
+        ``gps_handler_node._update_next_hint_smoother`` (L1284):
+        ``raw = self._project_world_to_odom(self._next_hint_world_xy)``
+        — uses only EKF state (``ekf.pos_xy``, ``ekf.theta``) and
+        ``self.odom``; no ``true_heading`` leak. Returns ``None`` if
+        the hint isn't cached yet."""
+        if self._next_hint_world_xy is None:
+            return None
+        if self.ekf is None:
+            ex, ey = (0.0, 0.0)
+        else:
+            ex, ey = self.ekf.pos_xy
+        hx_w, hy_w = self._next_hint_world_xy
+        dx_w = hx_w - ex
+        dy_w = hy_w - ey
+        theta = self.heading_offset_est
+        c = math.cos(-theta); s = math.sin(-theta)
+        dx_o = c * dx_w - s * dy_w
+        dy_o = s * dx_w + c * dy_w
+        ox, oy = self.odom[0], self.odom[1]
+        return (ox + dx_o, oy + dy_o)
+
+    def _update_next_hint_smoother(self):
+        """improve/gps-waypoint-continuity — shadow EWMA on the
+        cached next-up waypoint. No envelope filter (the envelope's
+        1/r gain keys off the ACTIVE goal's robot-to-goal lever
+        arm, which doesn't apply to a future goal); just the same
+        EWMA + SNAP shape as the active smoother. Promotion into
+        ``self._smoothed_candidate`` happens in
+        ``_advance_to_next_leg`` when the cached hint matches the
+        new leg's goal within ``_hint_match_tolerance_m``.
+
+        Mirrors deployed gps_handler_node._update_next_hint_smoother
+        (L1269-1297)."""
+        if not self._next_hint_enabled:
+            return
+        if self._next_hint_world_xy is None:
+            return
+        # improve/gps-waypoint-continuity: shadow EWMA consumes the
+        # ODOM-frame projection (deployed-equivalent) so the smoothed
+        # hint stays in the same frame as ``_smoothed_candidate``
+        # (also odom-frame after Fix 2). Promotion at leg switch via
+        # ``_advance_to_next_leg`` then transfers the smoothed value
+        # frame-consistently. Mirrors deployed L1284.
+        raw = self._compute_raw_next_hint_candidate_odom_frame()
+        if raw is None:
+            return
+        if self._next_hint_smoothed_candidate is None:
+            self._next_hint_smoothed_candidate = raw
+            return
+        sx, sy = self._next_hint_smoothed_candidate
+        dx = raw[0] - sx
+        dy = raw[1] - sy
+        if (dx * dx + dy * dy) > (CANDIDATE_SNAP_M * CANDIDATE_SNAP_M):
+            self._next_hint_smoothed_candidate = raw
+        else:
+            a = CANDIDATE_SMOOTH_ALPHA
+            self._next_hint_smoothed_candidate = (sx + a * dx, sy + a * dy)
 
     def _refresh_dist_history(self):
         """Append the current raw-GPS distance-to-goal to the
@@ -2845,8 +3230,173 @@ class GPSWaypointSim:
         self._update_stuck()
 
     # -- Stepping --------------------------------------------------------
+    def _advance_to_next_leg(self):
+        """Pop the next ``(lat, lon)`` off ``self.goal_queue`` and
+        reseat the agent on the new goal — mirrors the per-leg
+        transition the deployed ``gps_handler_node`` performs when
+        a new ``NavigateToWaypoint`` goal supersedes the previous
+        one on branch ``origin/improve/gps-waypoint-continuity``.
+
+        Cache (preserved across the leg boundary) — the "preemptive
+        next-goal cache" + "shadow EWMA chaining" referenced in the
+        deployed design:
+
+          * ``self.ekf``           — full EKF state (x, y, θ_offset),
+                                     covariance P, ``update_count``,
+                                     ``rejected_count``, and
+                                     ``consecutive_rejects``. The
+                                     heading offset learned by leg 1
+                                     applies verbatim to legs 2/3.
+          * ``self.gps_history``   — the closed-form fit's sample
+                                     window. Deployed handler keeps
+                                     ``self._gps_history`` across
+                                     legs so periodic refit /
+                                     resync can fire immediately on
+                                     a new leg.
+          * ``self.bootstrap_done``— never re-bootstrap once True
+                                     (deployed sets it True from
+                                     init; sim flips on first 5 m
+                                     of travel and keeps it).
+          * ``self._yaw_bias_offset`` /
+            ``self.K_est`` /
+            ``self.D_total``       — encoder yaw bias state. The
+                                     joint (θ, K) fit's calibration
+                                     survives.
+          * ``self._datum``-equivalents (``LAT_CENTER`` /
+            ``LON_CENTER``)        — implicit (module-scoped); no
+                                     re-survey on leg switch.
+          * ``self._heading_resync_count`` /
+            ``self._moving_away_event_count`` /
+            ``self._divergence_event_count`` /
+            ``self._cand_reject_count``
+                                   — diagnostic counters keep
+                                     accumulating across legs.
+
+        Reset on each leg start (the "per-leg baselines") — matches
+        the deployed handler's leg-switch path
+        (``gps_handler_node._execute_callback`` lines ~1753-1855):
+
+          * ``self.goal_world``           — replaced with the new leg.
+          * ``self.published_goal_world`` — re-seeded to the new goal
+                                            so the candidate-goal
+                                            pipeline re-emits.
+          * ``self.refinement_locked``    — False; new goal, new
+                                            convergence bubble.
+          * ``self._smoothed_candidate``  — None; deployed handler
+                                            clears it on every new
+                                            active goal.
+          * ``self._dist_history``        — cleared so moving-away
+                                            measures from
+                                            post-switch state, not
+                                            stale pre-switch
+                                            distances.
+          * ``self._envelope_suspended_until_s`` — 0 (cleared baseline).
+          * ``self._local_d_start`` /
+            ``self._world_d_start``       — None (lazy-init on next
+                                            odom tick with both EKF
+                                            pos + GPS available;
+                                            mirrors deployed
+                                            ``_ActiveGoal.local_d_start``
+                                            / ``world_d_start``).
+          * ``self._divergence_cooldown_until`` — -1 (fresh baseline
+                                            window).
+          * ``self._stuck_recovery_until`` — -1 (the new leg's
+                                            stuck-detector starts
+                                            from scratch).
+          * ``self.arrived``              — False (continue running).
+          * ``self.coasting``             — False (drive again).
+          * ``self.robot_declared_success`` etc. — cleared so the
+                                            next leg's onboard
+                                            arrival fires fresh.
+          * ``self.path_world`` /
+            ``self.last_planned_goal``    — None; force an A* replan
+                                            against the new goal on
+                                            the next tick.
+          * ``self._leg_start_step`` /
+            ``self._leg_start_sim_time``  — stamped to now so the
+                                            snapshot classifier and
+                                            per-leg timing telemetry
+                                            measure from leg start.
+
+        Returns True if a new leg was popped, False if the queue
+        was empty (end-of-mission)."""
+        if not self.goal_queue:
+            return False
+        next_lat, next_lon = self.goal_queue.pop(0)
+        self.goal_world = latlon_to_meters(next_lat, next_lon)
+        self.leg_index += 1
+        # improve/gps-waypoint-continuity — promotion check.
+        # Mirrors deployed L2074-2094: if the cached hint matches
+        # the new leg's goal within ``_hint_match_tolerance_m``,
+        # promote the shadow EWMA's current value into the active
+        # smoother (warm start). Otherwise leave the active
+        # smoother as None (cold start — bit-identical to the
+        # pre-port reset path). Either way, clear the hint cache
+        # so a stale shadow can't accidentally satisfy the match
+        # check on the next leg switch.
+        warm = None
+        if (self._next_hint_enabled
+                and self._next_hint_world_xy is not None
+                and self._next_hint_smoothed_candidate is not None):
+            dx = self.goal_world[0] - self._next_hint_world_xy[0]
+            dy = self.goal_world[1] - self._next_hint_world_xy[1]
+            hint_d = math.hypot(dx, dy)
+            if hint_d < self._hint_match_tolerance_m:
+                warm = self._next_hint_smoothed_candidate
+                self._next_hint_warm_start_count += 1
+        # ── Per-leg baselines (RESET) ────────────────────────────
+        self.arrived = False
+        self.coasting = False
+        self.robot_declared_success = False
+        self.robot_declared_at_step = None
+        self.robot_declared_truth_xy = None
+        self.refinement_locked = False
+        self._smoothed_candidate = warm
+        # Clear the hint cache after the match check (promoted or
+        # not). Mirrors deployed L2092-2094.
+        self._next_hint_lat_lon = None
+        self._next_hint_world_xy = None
+        self._next_hint_smoothed_candidate = None
+        self._dist_history = []
+        self._envelope_suspended_until_s = 0.0
+        self._local_d_start = None
+        self._world_d_start = None
+        self._divergence_cooldown_until = -1.0
+        self._stuck_recovery_until = -1.0
+        # Re-seed ``published_goal_world`` to the new goal so the
+        # candidate-goal pipeline re-emits cleanly on the next tick
+        # (deployed parlance: the first publish of a new leg goes
+        # to /goal_pose; subsequent in-mission updates flow through
+        # /goal_update).
+        self.published_goal_world = tuple(self.goal_world)
+        # Force a planner replan against the new goal.
+        self.path_world = None
+        self.last_planned_goal = None
+        self._best_i = 0
+        # Per-leg timing baselines.
+        self._leg_start_step = self.steps
+        self._leg_start_sim_time = self.sim_time
+        # improve/gps-waypoint-continuity — seed the next-hint cache
+        # from the NEW head of ``goal_queue`` so the shadow EWMA
+        # starts converging on the leg-after-this immediately. On
+        # the final leg the queue is empty after the pop above, and
+        # ``_seed_next_hint_from_queue`` no-ops — no further hints.
+        self._seed_next_hint_from_queue()
+        return True
+
     def step(self, dt=SIM_DT):
         """One physics tick. Returns True while still navigating."""
+        # ── Mission auto-advance ─────────────────────────────────
+        # If we arrived on a prior leg but still have queued
+        # waypoints, pop the next one and continue. The leg-switch
+        # transition preserves the EKF / heading-fit cache and
+        # resets only the per-leg baselines (see
+        # ``_advance_to_next_leg`` for the full cache-vs-reset
+        # ledger, which mirrors the deployed
+        # ``gps_handler_node`` behavior on branch
+        # ``origin/improve/gps-waypoint-continuity``).
+        if self.arrived and self.goal_queue:
+            self._advance_to_next_leg()
         if self.arrived and not self.coasting:
             return False
         self.steps += 1
@@ -2878,6 +3428,9 @@ class GPSWaypointSim:
         # resyncs propagate to the planner immediately while small
         # GPS-noise wiggles get filtered.
         self._update_candidate_smoother()
+        # Shadow EWMA on the cached next-goal hint (no-op in
+        # single-goal mode). Mirrors deployed L924.
+        self._update_next_hint_smoother()
         # Anti-spin recovery — reads `bootstrap_done`, `arrived`, and
         # the EKF position estimate. Must run after the EKF / heading
         # bookkeeping (which `_tick_gps` did above) and before the
@@ -2898,7 +3451,28 @@ class GPSWaypointSim:
         # mirrors what a real NAV2 stack would actually receive.
         publish_period = 1.0 / max(NAV2_GOAL_HZ, 1e-3)
         if (self.sim_time - self._last_published_time) >= publish_period:
-            self.published_goal_world = live_candidate
+            # Real-robot parity, mirrored from
+            # gps_handler_node._publish_goal (L1574-1577) on branch
+            # ``origin/improve/gps-waypoint-continuity``.
+            # ``refinement_locked`` is recomputed FRESH every publish
+            # tick — not latched. A noisy GPS update that briefly dips
+            # the EKF inside the STOP_REFINE bubble does NOT
+            # permanently freeze the published goal; if the EKF
+            # wanders back outside, publishing resumes. This matches
+            # the deployed gate which is a per-tick comparison, not a
+            # one-shot latch. The boolean attribute is preserved for
+            # the status panel — only its previous-frame value is no
+            # longer consulted as the gate.
+            if self.ekf is not None:
+                ex, ey = self.ekf.pos_xy
+                d_goal = math.hypot(ex - self.goal_world[0],
+                                    ey - self.goal_world[1])
+                threshold = STOP_REFINE_K * STOP_REFINE_SIGMA_GPS_M
+                self.refinement_locked = d_goal < threshold
+                if not self.refinement_locked:
+                    self.published_goal_world = live_candidate
+            else:
+                self.published_goal_world = live_candidate
             self._last_published_time = self.sim_time
         candidate_goal = self.published_goal_world
         path = self.path_world
@@ -3250,6 +3824,21 @@ class GPSWaypointSim:
                     self.ekf.P[1, 2] = 0.0
                     self.ekf.P[2, 2] = math.radians(60.0) ** 2
                 elif not self.bootstrap_done:
+                    # DEAD BRANCH — matches deployed L871 on
+                    # ``origin/improve/gps-waypoint-continuity``.
+                    # ``bootstrap_done`` is initialized True from
+                    # ``__init__`` so this branch is unreachable in
+                    # production; the EKF runs predict/update from
+                    # tick 1 with theta_var0 = π², and the first GPS
+                    # update's Kalman gain ≈ 1.0 on θ produces the same
+                    # snap-on-first-sample behavior the explicit
+                    # bootstrap reset used to provide. Body preserved
+                    # for documentation / defensive equivalence: any
+                    # future caller that does flip ``bootstrap_done``
+                    # back to False will still run the pre-port
+                    # ``ekf.update(..., gate_chi2=1e9)`` + closed-form
+                    # ``reset_theta`` + ``_adopt_K`` sequence and
+                    # graduate when ``odom_dist > 5 AND baseline > 5``.
                     self.ekf.update(new_gps[0], new_gps[1],
                                     gate_chi2=1e9)
                     # Bootstrap fit defaults to anchor-on-first
@@ -3542,7 +4131,10 @@ class GPSWaypointGUI:
         self.spoofers = list(spoofers)
         self.args = args
 
-        self.fig = plt.figure(figsize=(14, 8.5), facecolor="#1a1a1a")
+        # 16×9 figsize (was 14×8.5) — gives the right-edge "setup" column
+        # of the status panel enough room so labels like "True θ -173.26° hidden"
+        # don't wrap or clip past the figure boundary.
+        self.fig = plt.figure(figsize=(16, 9), facecolor="#1a1a1a")
         self.fig.canvas.manager.set_window_title(
             "GPS Waypoint Sim — magnetometer-less heading discovery")
         gs = self.fig.add_gridspec(2, 3,
@@ -3555,8 +4147,13 @@ class GPSWaypointGUI:
         self.ax.set_xlim(-MAP_HALF, MAP_HALF)
         self.ax.set_ylim(-MAP_HALF, MAP_HALF)
         self.ax.set_aspect("equal")
+        # Title doubles as the live keybinding hint. The GPS sim is
+        # auto-spawn (no click-to-place), so we advertise the keys the
+        # ``_on_key`` handler actually supports: P/space pause, R reset,
+        # Q/Esc quit. Matches the LiDAR sim's title-as-cheatsheet idiom.
         self.ax.set_title(
-            f"500 ft map · {LAT_CENTER:.5f} N, {abs(LON_CENTER):.5f} W",
+            f"P=Pause | R=Reset | Q=Quit  ·  500 ft · "
+            f"{LAT_CENTER:.5f} N, {abs(LON_CENTER):.5f} W",
             color="#e0e0e0", fontsize=10)
         self.ax.set_xlabel("East (m)", color="#a0a0a0")
         self.ax.set_ylabel("North (m)", color="#a0a0a0")
@@ -3812,13 +4409,41 @@ class GPSWaypointGUI:
             self.compass_est_label.set_visible(False)
             self.ekf_heading_arrow.set_visible(False)
 
+        # Mini-cam + status text now blit every frame too — they are
+        # cheap (single ``draw_artist`` per artist, no canvas redraw),
+        # so the user sees the follow-cam, goal-cam, and status text
+        # update at the full 30 FPS. The old ``MINI_REFRESH_EVERY``
+        # gate is gone; instead the follow-cam and goal-cam use a
+        # dead-zone in ``_render_dynamic_panels`` — they only call
+        # ``set_xlim/set_ylim`` (which would invalidate the bg) when
+        # the robot leaves the dead zone, otherwise the markers just
+        # slide within the existing window.
+        self._frame_idx = 0
+        self._blit_supported = True
+        self._ax_bg = None
+        self._mini_bg = None
+        self._goal_mini_bg = None
+        self._status_bg = None
+        self._mini_center = None
+        self._goal_center = None
+        self._goal_half = None
+        self._panel_recenter_needed = False
+
         # ── Upper-right: 5×5 m follow-cam ─────────────────────────
         self.MINI_VIEW_HALF = 2.5    # metres from robot center
         self.ax_mini = self.fig.add_subplot(gs[0, 1])
         self.ax_mini.set_facecolor("#0d1f12")
         self.ax_mini.set_aspect("equal")
+        # Robot-local follow-cam: xlim/ylim fixed forever at ±MINI_VIEW_HALF
+        # and every artist's data is offset by ``-robot_pos`` per frame.
+        # That puts the robot at (0, 0) and slides the world around it,
+        # giving a perfectly smooth follow with no bg-invalidation /
+        # dead-zone snap.
+        h0 = self.MINI_VIEW_HALF
+        self.ax_mini.set_xlim(-h0, h0)
+        self.ax_mini.set_ylim(-h0, h0)
         self.ax_mini.set_title(
-            f"{2*self.MINI_VIEW_HALF:.0f}×{2*self.MINI_VIEW_HALF:.0f} m follow-cam",
+            f"{2*self.MINI_VIEW_HALF:.0f}×{2*self.MINI_VIEW_HALF:.0f} m follow-cam (robot-centered)",
             color="#a0a0a0", fontsize=9)
         self.ax_mini.tick_params(colors="#666", labelsize=7)
         for s in self.ax_mini.spines.values():
@@ -4038,13 +4663,17 @@ class GPSWaypointGUI:
             handletextpad=0.6, borderpad=0.5,
             labelspacing=0.4)
 
-        self.fig.subplots_adjust(left=0.06, right=0.99,
+        self.fig.subplots_adjust(left=0.05, right=0.985,
                                   top=0.95, bottom=0.07)
 
         self.fig.canvas.mpl_connect("key_press_event", self._on_key)
 
+        # 30 FPS render cadence — decoupled from SIM_DT (10 Hz physics).
+        # STEPS_PER_FRAME = 1 so each timer fire = one physics tick,
+        # which keeps the sim:wall ratio identical to the old 10 FPS
+        # × 3-step config while tripling visual smoothness.
         self._timer = self.fig.canvas.new_timer(
-            interval=int(SIM_DT * 1000))
+            interval=GUI_FRAME_DT_MS)
         self._timer.add_callback(self._tick)
         self._build_scenario_patches()
         self._refresh_static_status_header()
@@ -4276,6 +4905,33 @@ class GPSWaypointGUI:
         self._last_motion_dir = sim.true_heading
         self._refresh_static_status_header()
         self._render_dynamic()
+        # Static scenery changed — invalidate the blit cache so the
+        # next ``draw_event`` callback re-snapshots a fresh background
+        # for the new obstacle / roof / projector layout.
+        self._ax_bg = None
+        # Pre-mark the new peer_bodies / peer_trails / peer_scatter /
+        # peer_trail_lc animated NOW so the next ``canvas.draw()``
+        # excludes them from the static bg snapshot. Without this,
+        # there's a one-frame window where the new peer artists are
+        # baked into ``_ax_bg`` (since ``set_animated(True)`` happens
+        # later inside ``_setup_blit``) and the subsequent blit's
+        # ``draw_artist`` paints a SECOND copy on top — the classic
+        # double-render. The next ``_setup_blit`` will re-set
+        # animated on every artist (idempotent), so this is a safety
+        # net for the gap between R and the first paint event.
+        if getattr(self, "_blit_supported", True):
+            for body in self.peer_bodies:
+                try: body.set_animated(True)
+                except Exception: pass
+            for trail in self.peer_trails:
+                try: trail.set_animated(True)
+                except Exception: pass
+            if self.peer_scatter is not None:
+                try: self.peer_scatter.set_animated(True)
+                except Exception: pass
+            if self.peer_trail_lc is not None:
+                try: self.peer_trail_lc.set_animated(True)
+                except Exception: pass
         self.fig.canvas.draw_idle()
 
     def _refresh_static_status_header(self):
@@ -4299,6 +4955,16 @@ class GPSWaypointGUI:
         )
 
     def _render_dynamic(self):
+        """Full per-frame refresh. Kept for callers that aren't part
+        of the blit fast-path (R-reset, initial draw)."""
+        self._render_dynamic_main()
+        self._render_dynamic_panels()
+
+    def _render_dynamic_main(self):
+        """Main-map artists only — the set the blit fast-path stamps
+        every tick. No mini-cam axes-limit changes (those live in
+        ``_render_dynamic_panels``) so a blit-only frame doesn't dirty
+        the cached background by re-running the goal-cam autozoom."""
         sim = self.sim
         # Per-peer body + trail (no-op for single-agent runs).
         if self.heavy_multi and self.peer_scatter is not None:
@@ -4442,46 +5108,70 @@ class GPSWaypointGUI:
         else:
             self.dropout_ring.set_alpha(0.0)
 
-        # ── Follow-cam (5×5 m around robot) ─────────────────────────
+    def _render_dynamic_panels(self):
+        """Mini follow-cam, goal-cam, and status text. Gated to every
+        Nth tick by ``_tick`` so the main-map blit can run at full
+        cadence — these axes share the figure canvas with the main
+        map, so refreshing them forces a real ``draw_idle`` that
+        invalidates the blit cache."""
+        sim = self.sim
+        ig = sim.published_goal_world
+        # ``motion_dir`` is computed in ``_render_dynamic_main`` (the
+        # body-heading-in-world the truth arrow uses) and cached on
+        # ``self._last_motion_dir`` so this gated panel refresh can
+        # consume it without recomputing.
+        motion_dir = getattr(self, "_last_motion_dir", sim.body_heading_world)
+        # ── Follow-cam (5×5 m around robot, robot-local frame) ──────
+        # The cam axes' xlim/ylim are fixed at ±MINI_VIEW_HALF (set
+        # once at panel construction). Each frame we offset every
+        # artist's data by ``-robot_pos`` so the robot stays at (0, 0)
+        # and the world slides smoothly underneath it. No xlim change
+        # per frame → no bg re-snapshot → no dead-zone jump.
         rx, ry = sim.true_pos
-        h = self.MINI_VIEW_HALF
-        self.ax_mini.set_xlim(rx - h, rx + h)
-        self.ax_mini.set_ylim(ry - h, ry + h)
-
-        self.mini_robot.center = (rx, ry)
         ah = 0.9
-        self.mini_heading_arrow.xy = (
-            rx + ah * math.cos(motion_dir),
-            ry + ah * math.sin(motion_dir))
-        self.mini_heading_arrow.set_position((rx, ry))
+        # Robot stays at origin
+        self.mini_robot.center = (0.0, 0.0)
+        self.mini_heading_arrow.xy = (ah * math.cos(motion_dir),
+                                       ah * math.sin(motion_dir))
+        self.mini_heading_arrow.set_position((0.0, 0.0))
 
         if sim.true_trail:
-            tx = [p[0] for p in sim.true_trail]
-            ty = [p[1] for p in sim.true_trail]
-            self.mini_trail_line.set_data(tx, ty)
+            self.mini_trail_line.set_data(
+                [p[0] - rx for p in sim.true_trail],
+                [p[1] - ry for p in sim.true_trail])
+        else:
+            self.mini_trail_line.set_data([], [])
 
         if sim.path_world:
             self.mini_path_line.set_data(
-                [p[0] for p in sim.path_world],
-                [p[1] for p in sim.path_world])
+                [p[0] - rx for p in sim.path_world],
+                [p[1] - ry for p in sim.path_world])
         else:
             self.mini_path_line.set_data([], [])
 
         if sim.gps_scatter:
-            self.mini_gps_scatter.set_offsets(np.array(sim.gps_scatter))
+            arr = np.asarray(sim.gps_scatter, dtype=float)
+            arr = arr - np.array([rx, ry])
+            self.mini_gps_scatter.set_offsets(arr)
         else:
             self.mini_gps_scatter.set_offsets(np.empty((0, 2)))
 
         if sim.ekf is not None:
             ex, ey = sim.ekf.pos_xy
-            self.mini_ekf_marker.set_data([ex], [ey])
+            self.mini_ekf_marker.set_data([ex - rx], [ey - ry])
         else:
             self.mini_ekf_marker.set_data([], [])
 
-        self.mini_intermediate_marker.set_data([ig[0]], [ig[1]])
+        self.mini_intermediate_marker.set_data([ig[0] - rx], [ig[1] - ry])
+
+        # Goal star + 1 m ring (offset into robot-local frame).
+        gx_w, gy_w = sim.goal_world
+        self.mini_goal_circle.center = (gx_w - rx, gy_w - ry)
+        self.mini_goal_inner_ring.center = (gx_w - rx, gy_w - ry)
+        self.mini_goal_marker.set_data([gx_w - rx], [gy_w - ry])
 
         if not sim.gps_connected:
-            self.mini_dropout_ring.center = (rx, ry)
+            self.mini_dropout_ring.center = (0.0, 0.0)
             self.mini_dropout_ring.set_alpha(1.0)
         else:
             self.mini_dropout_ring.set_alpha(0.0)
@@ -4522,10 +5212,27 @@ class GPSWaypointGUI:
                 half_gc = max(self.GOAL_VIEW_HALF_MIN,
                                min(self.GOAL_VIEW_HALF_MAX,
                                     spread * 0.5 + 0.6))
-            self.ax_goal_mini.set_xlim(cx_gc - half_gc,
-                                        cx_gc + half_gc)
-            self.ax_goal_mini.set_ylim(cy_gc - half_gc,
-                                        cy_gc + half_gc)
+            # Goal-cam recenter: dead-zone on EITHER the center or
+            # the half-extent. Half-extent can grow / shrink as the
+            # candidate goal moves vs the true goal, so we trip the
+            # recenter when either drifts past a fraction of the
+            # current cam window.
+            need_recenter = self._goal_center is None or self._goal_half is None
+            if not need_recenter:
+                dz_c = self._goal_half * 0.4
+                dz_h = self._goal_half * 0.5
+                need_recenter = (
+                    abs(cx_gc - self._goal_center[0]) > dz_c or
+                    abs(cy_gc - self._goal_center[1]) > dz_c or
+                    abs(half_gc - self._goal_half) > dz_h)
+            if need_recenter:
+                self.ax_goal_mini.set_xlim(cx_gc - half_gc,
+                                            cx_gc + half_gc)
+                self.ax_goal_mini.set_ylim(cy_gc - half_gc,
+                                            cy_gc + half_gc)
+                self._goal_center = (cx_gc, cy_gc)
+                self._goal_half = half_gc
+                self._panel_recenter_needed = True
             self.goalcam_intermediate.set_data([gx], [gy])
             self.goalcam_robot.center = (sim.true_pos[0],
                                           sim.true_pos[1])
@@ -4609,6 +5316,18 @@ class GPSWaypointGUI:
         ekf_rej = sim.ekf.rejected_count if sim.ekf else 0
         ekf_upd = sim.ekf.update_count if sim.ekf else 0
         boot = "✓" if sim.bootstrap_done else "…"
+        # Heading-EKF "converged" flag for the status line: bootstrap is
+        # finished AND σ_θ is tight enough that the published candidate
+        # has stopped wandering. 5° σ_θ matches the resync threshold's
+        # rough order so the indicator flips on the same beat the
+        # operator can see the cloud freeze. Purely a display flag —
+        # no algorithm path looks at this.
+        if sim.ekf is None:
+            converged = "n/a"
+        elif sim.bootstrap_done and ekf_tstd <= 5.0:
+            converged = "✓"
+        else:
+            converged = "…"
 
         path_n = len(sim.path_world) if sim.path_world else 0
 
@@ -4637,12 +5356,24 @@ class GPSWaypointGUI:
             ens_lines = ""
 
         primary_label = "primary" if self.is_multi else "agent"
+        # Chained-mission leg indicator. Only surfaces when the
+        # agent is actually running a multi-leg mission (regression
+        # gate for single-goal default behavior). Bare "leg N/M"
+        # line keeps the visual cheap.
+        if getattr(sim, "leg_count", 1) > 1:
+            mission_lines = (
+                f"mission         "
+                f"leg {sim.leg_index}/{sim.leg_count}\n"
+            )
+        else:
+            mission_lines = ""
         body = (
             f"t = {sim.sim_time:6.1f} s   {state}\n"
             f"GPS: {gps_state}\n"
             + ens_lines +
             f"\n"
             f"── {primary_label} ─────────────\n"
+            + mission_lines +
             f"dist → goal     {true_dist:6.2f} m\n"
             f"in goal         {overlap*100:5.1f} %\n"
             f"speed           {speed_mph:5.2f} mph\n"
@@ -4653,6 +5384,7 @@ class GPSWaypointGUI:
             f"σ_pos       {ekf_pstd[0]:4.2f}, {ekf_pstd[1]:4.2f} m\n"
             f"updates / rej   {ekf_upd:>4} / {ekf_rej}\n"
             f"bootstrap       {boot}\n"
+            f"converged       {converged}\n"
             f"\n"
             f"── cloud ──────────────\n"
             f"n={cloud_n:>4}    mean→goal {mean_dist:5.2f} m\n"
@@ -4663,6 +5395,189 @@ class GPSWaypointGUI:
         self.status_text.set_text(body)
         self.status_text.set_color(state_color if (sim.arrived or sim.coasting) else "#f0f0f0")
         self.setup_text.set_text(self._setup)
+
+    # ── Blit fast-path ──────────────────────────────────────────
+    def _collect_mini_animated_artists(self):
+        """Follow-cam (``ax_mini``) dynamic artists. The cam re-centers
+        only when the robot leaves the dead zone (see ``_render_dynamic_panels``);
+        between recenters every frame just blits these artists in place.
+        Sorted by zorder — see ``_collect_main_animated_artists`` for
+        the live-vs-static parity rationale."""
+        arts = [self.mini_path_line, self.mini_gps_scatter,
+                self.mini_trail_line, self.mini_robot,
+                self.mini_heading_arrow, self.mini_ekf_marker,
+                self.mini_intermediate_marker, self.mini_dropout_ring,
+                self.mini_goal_circle, self.mini_goal_inner_ring,
+                self.mini_goal_marker]
+        arts.sort(key=lambda a: a.get_zorder())
+        return arts
+
+    def _collect_goal_mini_animated_artists(self):
+        """Goal-cam (``ax_goal_mini``) dynamic artists. Sorted by zorder
+        to match ``Axes.draw``'s per-tick stacking."""
+        if self.is_multi:
+            return []
+        arts = [self.goalcam_intermediate, self.goalcam_belief_cloud,
+                self.goalcam_belief_mean, self.goalcam_gps_scatter,
+                self.goalcam_ekf_marker, self.goalcam_robot,
+                self.goalcam_goal_circle, self.goalcam_goal_inner,
+                self.goalcam_goal_marker]
+        arts.sort(key=lambda a: a.get_zorder())
+        return arts
+
+    def _collect_status_animated_artists(self):
+        """Status text panel (``ax_status``) dynamic artists."""
+        return [self.status_text, self.setup_text]
+
+    def _collect_main_animated_artists(self):
+        """Artists on the main map (``self.ax``) that change per-frame.
+        These get ``set_animated(True)`` so the cached background
+        excludes them, and a per-frame ``draw_artist`` stamps them on
+        top. Anything not in this list lives in the static snapshot.
+
+        Sorted by zorder so the per-frame ``draw_artist`` sequence in
+        ``_blit_main`` paints in the same order matplotlib uses for a
+        full ``Axes.draw`` (which zorder-sorts its children). Without
+        the sort, peer_bodies (z=11) appended last in the literal list
+        would paint OVER compass labels (z=16) on the live screen but
+        UNDER them in static savefig — producing exactly the "two
+        things being rendered" mismatch between live and snapshot.
+        """
+        arts = [self.path_line, self.window_patch,
+                self.gps_scatter, self.belief_cloud,
+                self.belief_mean_marker,
+                self.trail_line, self.robot_body,
+                self.heading_arrow, self.ekf_marker,
+                self.ekf_heading_arrow, self.intermediate_marker,
+                self.dropout_ring,
+                # Compass clock-hands rotate as the EKF refines θ.
+                self.compass_real_arrow, self.compass_est_arrow,
+                self.compass_real_dot, self.compass_est_dot,
+                self.compass_real_label, self.compass_est_label,
+                self.goal_circle, self.goal_inner_ring,
+                self.goal_marker, self.start_marker]
+        # Per-peer bodies/trails (heavy-multi uses a single
+        # scatter + LineCollection — both also animated).
+        if self.peer_scatter is not None:
+            arts.append(self.peer_scatter)
+        if self.peer_trail_lc is not None:
+            arts.append(self.peer_trail_lc)
+        arts.extend(self.peer_bodies)
+        arts.extend(self.peer_trails)
+        # Stable sort by zorder so the blit draw order matches
+        # ``Axes.draw``'s zorder-sorted iteration.
+        arts.sort(key=lambda a: a.get_zorder())
+        return arts
+
+    def _setup_blit(self):
+        """Mark dynamic artists on all four panels animated, force a
+        full canvas draw to lay down the static backgrounds, then
+        snapshot ``ax.bbox`` / ``ax_mini.bbox`` / ``ax_goal_mini.bbox``
+        / ``ax_status.bbox`` for per-axes blit restores. Called once
+        at startup and whenever any axes' static content changes
+        (R-reset, follow-cam recenter, goal-cam recenter).
+
+        Re-entrancy guard: ``self.fig.canvas.draw()`` below fires a
+        ``draw_event`` synchronously, which calls back into
+        ``_on_first_draw`` → ``_setup_blit`` again. Without this guard
+        each startup runs the full setup pipeline twice (once outer,
+        once inner) and the inner copy_from_bbox captures the bg BEFORE
+        the outer set_animated calls finish — the outer call then
+        overwrites with a re-snapshot, but for one frame between the
+        recursion unwinding and the next paint the screen can show
+        the bg with animated artists still baked in. Skip the inner
+        call cleanly."""
+        if not getattr(self, "_blit_supported", True):
+            return
+        if getattr(self, "_in_setup_blit", False):
+            return
+        self._in_setup_blit = True
+        all_artists = (self._collect_main_animated_artists()
+                       + self._collect_mini_animated_artists()
+                       + self._collect_goal_mini_animated_artists()
+                       + self._collect_status_animated_artists())
+        try:
+            for art in all_artists:
+                art.set_animated(True)
+            self.fig.canvas.draw()
+            cb = self.fig.canvas.copy_from_bbox
+            self._ax_bg = cb(self.ax.bbox)
+            self._mini_bg = cb(self.ax_mini.bbox)
+            self._goal_mini_bg = (cb(self.ax_goal_mini.bbox)
+                                   if not self.is_multi else None)
+            self._status_bg = cb(self.ax_status.bbox)
+            self._blit_supported = True
+        except Exception:
+            self._blit_supported = False
+            for art in all_artists:
+                try: art.set_animated(False)
+                except Exception: pass
+            self._ax_bg = None
+            self._mini_bg = None
+            self._goal_mini_bg = None
+            self._status_bg = None
+        finally:
+            self._in_setup_blit = False
+
+    def _blit_main(self):
+        """Single-blit atomic redraw of all four panels.
+
+        Issuing ``canvas.blit(axes.bbox)`` four times per frame caused
+        a visible mouse-trail effect: each blit is a separate Qt-level
+        partial update, and between them the user momentarily saw
+        in-between canvas states. Instead, restore each panel's bg +
+        draw_artist its animated artists in sequence (modifying the
+        backbuffer only), then push the whole figure to screen with
+        ONE ``blit(fig.bbox)`` at the end. No partial updates ever
+        reach the screen.
+        """
+        canvas = self.fig.canvas
+        try:
+            # Restore + draw on the backbuffer ONLY — no blit yet.
+            if self._ax_bg is not None:
+                canvas.restore_region(self._ax_bg)
+                for art in self._collect_main_animated_artists():
+                    if art.get_visible():
+                        self.ax.draw_artist(art)
+            if self._mini_bg is not None:
+                canvas.restore_region(self._mini_bg)
+                for art in self._collect_mini_animated_artists():
+                    if art.get_visible():
+                        self.ax_mini.draw_artist(art)
+            if self._goal_mini_bg is not None and not self.is_multi:
+                canvas.restore_region(self._goal_mini_bg)
+                for art in self._collect_goal_mini_animated_artists():
+                    if art.get_visible():
+                        self.ax_goal_mini.draw_artist(art)
+            if self._status_bg is not None:
+                canvas.restore_region(self._status_bg)
+                for art in self._collect_status_animated_artists():
+                    if art.get_visible():
+                        self.ax_status.draw_artist(art)
+            # Single atomic push of the whole figure to screen.
+            canvas.blit(self.fig.bbox)
+            # Clear the stale flag matplotlib raises when we call
+            # ``set_data`` / ``set_offsets`` / ``.center =`` on the
+            # animated artists. If we leave it True, the next Qt
+            # paintEvent calls ``canvas.draw()`` itself, which repaints
+            # the static layer over the blit'd output and produces the
+            # "two things being rendered" ghost effect on the live
+            # window. Setting it False here tells matplotlib the
+            # canvas is up to date; the next change-of-data will set
+            # it again.
+            self.fig.stale = False
+            for art_list in (self._collect_main_animated_artists(),
+                              self._collect_mini_animated_artists(),
+                              self._collect_goal_mini_animated_artists(),
+                              self._collect_status_animated_artists()):
+                for art in art_list:
+                    try:
+                        art.stale = False
+                    except Exception:
+                        pass
+            canvas.flush_events()
+        except Exception:
+            canvas.draw_idle()
 
     # ── Event handlers ───────────────────────────────────────────
     def _tick(self):
@@ -4680,8 +5595,39 @@ class GPSWaypointGUI:
                 any_running = True
             else:
                 break
-        self._render_dynamic()
-        self.fig.canvas.draw_idle()
+        # Always recompute the dynamic main-map artists (cheap
+        # set_data / set_offsets / annotation moves). The mini panels
+        # and status text are gated to every Nth tick to keep blit
+        # frames cheap — those panels use shared-canvas axes that
+        # need a full ``draw_idle`` to repaint, which is the ~50 ms
+        # cost we're shedding from the per-frame budget.
+        self._frame_idx = getattr(self, "_frame_idx", 0) + 1
+        # Render every panel's animated artist data every frame —
+        # this is cheap (set_data / set_offsets / center moves).
+        self._panel_recenter_needed = False
+        self._render_dynamic_main()
+        self._render_dynamic_panels()
+        if getattr(self, "_blit_supported", True):
+            # When a follow-cam recenter happened this frame, the new
+            # ``set_xlim/ylim`` invalidates the cached bgs (tick labels
+            # moved, gridlines shifted). Do a synchronous full canvas
+            # draw, then re-snapshot every panel's bg so the next
+            # blit restores the correct static layer.
+            if self._panel_recenter_needed:
+                self.fig.canvas.draw()
+                try:
+                    cb = self.fig.canvas.copy_from_bbox
+                    self._ax_bg = cb(self.ax.bbox)
+                    self._mini_bg = cb(self.ax_mini.bbox)
+                    self._goal_mini_bg = (cb(self.ax_goal_mini.bbox)
+                                           if not self.is_multi else None)
+                    self._status_bg = cb(self.ax_status.bbox)
+                except Exception:
+                    pass
+            self._blit_main()
+        else:
+            # Fall-through for backends that can't blit.
+            self.fig.canvas.draw_idle()
         if not any_running:
             self._timer.stop()
 
@@ -4732,6 +5678,28 @@ class GPSWaypointGUI:
 
     def run(self):
         self._paused = False
+        # plt.show under Qt5Agg blocks until the window closes, so we
+        # need to install the blit background *after* the figure has
+        # been realised and laid out. ``draw_event`` fires right after
+        # the first real paint — perfect hook for snapshotting the
+        # static background and toggling artists to animated mode.
+        # A defensive fallback also calls ``_setup_blit`` inline so
+        # backends that never emit ``draw_event`` (rare) still get a
+        # background captured. _tick checks ``_blit_supported`` and
+        # falls back to draw_idle if the snapshot fails.
+        def _on_first_draw(_evt):
+            if self._ax_bg is None:
+                self._setup_blit()
+        self._draw_cid = self.fig.canvas.mpl_connect(
+            "draw_event", _on_first_draw)
+        # Resize / DPI changes invalidate the cached background.
+        # Recapture on the next paint after a resize.
+        def _on_resize(_evt):
+            # Force a one-shot resnapshot by clearing the cache; the
+            # next ``draw_event`` callback above will refill it.
+            self._ax_bg = None
+        self._resize_cid = self.fig.canvas.mpl_connect(
+            "resize_event", _on_resize)
         self._timer.start()
         plt.show()
 
@@ -4902,6 +5870,24 @@ def build_scenario(args, seed=None):
                 rng, list(obstacles),
                 roofs=roofs, projectors=projectors,
                 jammers=jammers, foliage=foliage, spoofers=spoofers)
+    # Chained-mission goal override. Applies in BOTH the scripted
+    # and random branches so a default ``--single`` smoke run with
+    # ``--mission three-waypoint`` works without also passing
+    # ``--random``. Overrides --goal-lat / --goal-lon (the
+    # documented precedence). The remaining legs are threaded into
+    # each ``GPSWaypointSim`` via ``build_agents`` so the agent
+    # auto-advances on arrival.
+    if getattr(args, "mission", None) == "three-waypoint":
+        mission_lat, mission_lon = THREE_WAYPOINT_MISSION[0]
+        goal_world = latlon_to_meters(mission_lat, mission_lon)
+        # WP1 in our local-tangent plane is exactly (0, 0) because
+        # LAT_CENTER / LON_CENTER are pinned to WP1. The scripted
+        # start at (0, 0) would put the agent on top of leg 1's
+        # goal — first arrival fires on tick 1 and leg progression
+        # is uninstructive. Shift the start ~30 m north so leg 1
+        # is a real ~30 m drive and the EKF / heading-fit cache
+        # has motion to learn from before legs 2 and 3 kick in.
+        start_world = (0.0, 30.0)
     cm = Costmap(obstacles, projectors=projectors)
     return (cm, start_world, goal_world, true_heading,
             obstacles, roofs, projectors,
@@ -4928,6 +5914,16 @@ def build_agents(args, scenario, n_agents):
     base_seed = args.seed if args.seed is not None else 0
     spawn_perfect_twin = (
         getattr(args, "real", False) and n_agents == 1)
+    # Chained-mission queue (remaining legs after the seed goal,
+    # which ``build_scenario`` already projected into world meters).
+    # When ``--mission three-waypoint`` is set we hand every agent
+    # the same queue so a multi-agent ensemble all run the same
+    # 3-leg fixture; otherwise we pass an empty list so behavior is
+    # bit-identical to today.
+    if getattr(args, "mission", None) == "three-waypoint":
+        goal_queue = list(THREE_WAYPOINT_MISSION[1:])
+    else:
+        goal_queue = []
     sims = []
     for i in range(n_agents):
         rng_i = np.random.default_rng(base_seed * 7919 + i * 1000003 + 1)
@@ -4946,7 +5942,13 @@ def build_agents(args, scenario, n_agents):
         sims.append(GPSWaypointSim(
             cm, start_i, heading_i, goal, rng_i,
             roofs=roofs, projectors=proj,
-            jammers=jammers, foliage=foliage, spoofers=spoofers))
+            jammers=jammers, foliage=foliage, spoofers=spoofers,
+            goal_queue=goal_queue,
+            coldstart_bias_enabled=getattr(
+                args, "coldstart_bias_enable", False),
+            next_hint_enabled=(
+                True if getattr(args, "next_hint_enable", False)
+                else None)))
     if spawn_perfect_twin:
         # Match the primary's start, heading, and noise-RNG seed so
         # the only difference is encoder bias.
@@ -4956,7 +5958,13 @@ def build_agents(args, scenario, n_agents):
             cm, primary.start_world, primary.true_heading, goal, twin_rng,
             roofs=roofs, projectors=proj,
             jammers=jammers, foliage=foliage, spoofers=spoofers,
-            odom_yaw_bias_rate=0.0)
+            odom_yaw_bias_rate=0.0,
+            goal_queue=goal_queue,
+            coldstart_bias_enabled=getattr(
+                args, "coldstart_bias_enable", False),
+            next_hint_enabled=(
+                True if getattr(args, "next_hint_enable", False)
+                else None))
         sims.append(twin)
     return sims
 
@@ -4971,7 +5979,13 @@ def build_sim(args, seed=None):
     sim = GPSWaypointSim(cm, start, true_heading, goal, rng,
                           roofs=roofs, projectors=projectors,
                           jammers=jammers, foliage=foliage,
-                          spoofers=spoofers)
+                          spoofers=spoofers,
+                          coldstart_bias_enabled=getattr(
+                              args, "coldstart_bias_enable", False),
+                          next_hint_enabled=(
+                              True if getattr(
+                                  args, "next_hint_enable", False)
+                              else None))
     return sim, obstacles, roofs, projectors
 
 
@@ -5115,6 +6129,45 @@ def main(argv=None):
                              "(default: random).")
     parser.add_argument("--goal-lat", type=float, default=None)
     parser.add_argument("--goal-lon", type=float, default=None)
+    parser.add_argument("--mission", choices=["three-waypoint"],
+                        default=None,
+                        help="Run a chained multi-leg mission. "
+                             "'three-waypoint' uses the canonical "
+                             "GPS waypoints from the deployed "
+                             "stored_waypoints.txt and exercises the "
+                             "preemptive next-goal cache + per-leg "
+                             "baseline reset path from "
+                             "origin/improve/gps-waypoint-continuity. "
+                             "Overrides --goal-lat / --goal-lon.")
+    parser.add_argument(
+        "--coldstart-bias-enable",
+        action="store_true",
+        help="Mirrors deployed ROS parameter "
+             "``coldstart_bias_enabled`` (default False on the robot, "
+             "see gps_handler_node.py L481). When set, fires the "
+             "one-shot θ_offset snap from "
+             "_seed_coldstart_theta_if_needed on the very first leg "
+             "only (deployed L1179). The sim flag is currently a "
+             "wired stub on the agent (see "
+             "``GPSWaypointSim._coldstart_bias_enabled``) — flipping "
+             "it on does NOT yet snap θ because the sim has no "
+             "non-K_est seed path; left as a TODO so the launcher "
+             "can toggle the field-parity behavior the moment the "
+             "seed helper is implemented.")
+    parser.add_argument(
+        "--next-hint-enable",
+        action="store_true",
+        help="Mirrors deployed ROS parameter ``next_hint_enabled`` "
+             "(default False on the robot, see gps_handler_node.py "
+             "L466). When set, activates the shadow EWMA on the cached "
+             "next-goal waypoint so the leg-transition warm start "
+             "fires (``_update_next_hint_smoother`` + "
+             "``_advance_to_next_leg`` promotion check). The "
+             "single-goal headless smoke leaves this disabled so its "
+             "numerical output stays unaffected; the "
+             "``--mission three-waypoint`` smoke auto-enables the "
+             "shadow EWMA when a queue is present so the mission "
+             "exercise actually tests the preemptive-cache path.")
     parser.add_argument("--headless", action="store_true",
                         help="Run a few step()s without a window. "
                              "Used for smoke-testing.")
@@ -5196,10 +6249,19 @@ def main(argv=None):
             # early-exit conditions so apples-to-apples runs use
             # the same sim-time window.
             if not args.full_steps:
+                # Chained-mission gate: even if an agent has been
+                # classified for the *current* leg (arrived /
+                # predicted_success / predicted_failure), don't
+                # call the run "done" while it still has queued
+                # waypoints. The leg-advance happens at the top of
+                # the NEXT ``step()`` call, so we need to let that
+                # tick run.
                 n_classified = sum(
                     1 for s in agents
-                    if s.arrived or s.predicted_success
+                    if (s.arrived or s.predicted_success
                                   or s.predicted_failure)
+                    and not getattr(s, "goal_queue", [])
+                )
                 if n_classified == len(agents):
                     break
                 if not any_running:
@@ -5229,6 +6291,16 @@ def main(argv=None):
         n_stuck = sum(1 for s in agents
                        if s.path_world is None or len(s.path_world) < 2)
         will_converge = n_arrived + n_pred_ok
+        # Chained-mission leg progress. Only appended when the
+        # primary agent is on a multi-leg mission so the
+        # single-goal smoke output stays byte-identical to today
+        # (the documented regression gate).
+        mission_suffix = ""
+        if getattr(sim, "leg_count", 1) > 1:
+            mission_suffix = (
+                f" mission_leg={sim.leg_index}/{sim.leg_count}"
+                f" mission_remaining={len(sim.goal_queue)}"
+            )
         print(f"t={sim.sim_time:.2f}s steps={sim.steps} agents={len(agents)} "
               f"arrived={n_arrived}/{len(agents)} "
               f"pred_ok={n_pred_ok} pred_fail={n_pred_fail} "
@@ -5242,7 +6314,8 @@ def main(argv=None):
               f"ekf_σθ={ekf_tstd:.2f}° "
               f"ekf_upd/rej={ekf_upd}/{ekf_rej} "
               f"cloud_mean_dist={mean_dist:.2f}m "
-              f"pad={sim.last_pad}")
+              f"pad={sim.last_pad}"
+              + mission_suffix)
         return 0
 
     gui = GPSWaypointGUI(sim, obstacles, args,

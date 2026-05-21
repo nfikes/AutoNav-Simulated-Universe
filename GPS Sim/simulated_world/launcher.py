@@ -150,6 +150,25 @@ class LauncherWindow(QtWidgets.QWidget):
         goal_box = QtWidgets.QGroupBox("Goal override (optional)")
         goal_form = QtWidgets.QFormLayout(goal_box)
 
+        # Chained 3-waypoint mission (exercises the preemptive
+        # next-goal cache + per-leg baseline reset path on
+        # ``origin/improve/gps-waypoint-continuity``). When checked
+        # the explicit single-goal lat/lon inputs are disabled and
+        # ``--mission three-waypoint`` is passed instead.
+        self.mission_cb = QtWidgets.QCheckBox(
+            "Three-waypoint mission (chained + cached)")
+        self.mission_cb.setToolTip(
+            "Run the canonical 3 GPS waypoints from the deployed "
+            "stored_waypoints.txt as a chained mission. Exercises "
+            "the preemptive next-goal cache + per-leg baseline "
+            "reset path from origin/improve/gps-waypoint-continuity "
+            "— EKF / heading-fit state are preserved across legs "
+            "while the candidate-goal smoother and moving-away "
+            "window are cleared on each leg switch. Passes "
+            "--mission three-waypoint; overrides --goal-lat / "
+            "--goal-lon.")
+        goal_form.addRow(self.mission_cb)
+
         self.goal_cb = QtWidgets.QCheckBox("Set explicit goal lat/lon")
         goal_form.addRow(self.goal_cb)
 
@@ -169,6 +188,22 @@ class LauncherWindow(QtWidgets.QWidget):
 
         self.goal_cb.toggled.connect(self.goal_lat.setEnabled)
         self.goal_cb.toggled.connect(self.goal_lon.setEnabled)
+
+        # Three-waypoint mission and explicit single-goal override
+        # are mutually exclusive. When the mission box is checked,
+        # disable the single-goal control AND its child spin boxes.
+        def _sync_mission():
+            mission_on = self.mission_cb.isChecked()
+            self.goal_cb.setEnabled(not mission_on)
+            if mission_on:
+                # Uncheck the single-goal toggle so its preview
+                # contribution drops, AND force the spin boxes
+                # disabled regardless of the toggle's prior state.
+                self.goal_cb.setChecked(False)
+                self.goal_lat.setEnabled(False)
+                self.goal_lon.setEnabled(False)
+        self.mission_cb.toggled.connect(_sync_mission)
+        _sync_mission()
 
         root.addWidget(goal_box)
 
@@ -252,7 +287,11 @@ class LauncherWindow(QtWidgets.QWidget):
             args.append("--no-ekf")
         if self.heading_cb.isChecked():
             args.extend(["--heading-deg", f"{self.heading_spin.value():g}"])
-        if self.goal_cb.isChecked():
+        if self.mission_cb.isChecked():
+            # Mission mode overrides single-goal lat/lon (the
+            # documented precedence in gps_sim_gui.py).
+            args.extend(["--mission", "three-waypoint"])
+        elif self.goal_cb.isChecked():
             args.extend(["--goal-lat", f"{self.goal_lat.value():.6f}"])
             args.extend(["--goal-lon", f"{self.goal_lon.value():.6f}"])
 
