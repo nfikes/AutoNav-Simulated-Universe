@@ -34,9 +34,16 @@ class LauncherWindow(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("GPS Sim — Launch Options")
-        self.setMinimumWidth(540)
+        self.setMinimumWidth(980)
 
         root = QtWidgets.QVBoxLayout(self)
+
+        cols_row = QtWidgets.QHBoxLayout()
+        left_col = QtWidgets.QVBoxLayout()
+        right_col = QtWidgets.QVBoxLayout()
+        cols_row.addLayout(left_col, 1)
+        cols_row.addLayout(right_col, 1)
+        root.addLayout(cols_row)
 
         # ── Scenario preset ───────────────────────────────────────
         preset_box = QtWidgets.QGroupBox("Scenario")
@@ -49,7 +56,7 @@ class LauncherWindow(QtWidgets.QWidget):
                 rb.setChecked(True)
             self.preset_group.addButton(rb, i)
             preset_layout.addWidget(rb)
-        root.addWidget(preset_box)
+        left_col.addWidget(preset_box)
 
         # ── Agent options ─────────────────────────────────────────
         agents_box = QtWidgets.QGroupBox("Agents")
@@ -74,7 +81,7 @@ class LauncherWindow(QtWidgets.QWidget):
         self.seed_spin.setValue(42)
         agents_form.addRow("Random seed (--seed)", self.seed_spin)
 
-        root.addWidget(agents_box)
+        left_col.addWidget(agents_box)
 
         # Disable --agents while --single is checked.
         def _sync_single():
@@ -117,7 +124,7 @@ class LauncherWindow(QtWidgets.QWidget):
         self.spoofers_spin.setValue(0)
         world_form.addRow("Spoofers (--spoofers)", self.spoofers_spin)
 
-        root.addWidget(world_box)
+        right_col.addWidget(world_box)
 
         # ── Robot / EKF ───────────────────────────────────────────
         algo_box = QtWidgets.QGroupBox("Algorithm / robot")
@@ -144,7 +151,7 @@ class LauncherWindow(QtWidgets.QWidget):
         h_wrap.setLayout(h_row)
         algo_form.addRow("Heading (--heading-deg)", h_wrap)
 
-        root.addWidget(algo_box)
+        right_col.addWidget(algo_box)
 
         # ── Goal override ─────────────────────────────────────────
         goal_box = QtWidgets.QGroupBox("Goal override (optional)")
@@ -205,7 +212,7 @@ class LauncherWindow(QtWidgets.QWidget):
         self.mission_cb.toggled.connect(_sync_mission)
         _sync_mission()
 
-        root.addWidget(goal_box)
+        left_col.addWidget(goal_box)
 
         # ── Headless (advanced) ──────────────────────────────────
         headless_box = QtWidgets.QGroupBox("Headless (no window)")
@@ -228,7 +235,10 @@ class LauncherWindow(QtWidgets.QWidget):
         self.headless_cb.toggled.connect(self.headless_steps.setEnabled)
         self.headless_cb.toggled.connect(self.full_steps_cb.setEnabled)
 
-        root.addWidget(headless_box)
+        right_col.addWidget(headless_box)
+
+        left_col.addStretch(1)
+        right_col.addStretch(1)
 
         # ── Preview + launch ─────────────────────────────────────
         self.preview = QtWidgets.QLineEdit()
