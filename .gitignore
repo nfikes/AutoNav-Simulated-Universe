@@ -13,6 +13,7 @@ __pycache__/
 
 # Heavy local data — kept on disk, never committed
 Baked_Playbacks/
+bakes/
 example-playback-csv/
 tile_cache/
 
