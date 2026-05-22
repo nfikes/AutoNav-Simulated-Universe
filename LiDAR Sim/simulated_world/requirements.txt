@@ -1,6 +1,9 @@
 contourpy==1.3.3
 cycler==0.12.1
+embreex==4.4.0
 fonttools==4.63.0
+imageio==2.37.3
+imageio-ffmpeg==0.6.0
 joblib==1.5.3
 kiwisolver==1.5.0
 matplotlib==3.10.9
@@ -8,10 +11,12 @@ numpy==2.4.6
 numpy-stl==3.2.0
 packaging==26.2
 pillow==12.2.0
+pyopengl==3.1.10
 pyparsing==3.3.2
 pyqt5==5.15.11
 pyqt5-qt5==5.15.18
 pyqt5-sip==12.18.0
+pyqtgraph==0.14.0
 python-dateutil==2.9.0.post0
 python-utils==3.9.1
 rtree==1.4.1

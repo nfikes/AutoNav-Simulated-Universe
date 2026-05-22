@@ -444,8 +444,15 @@ class ThreeDState:
 def _classify_cloud_colors(cloud_s, origin, slope_grid, obs_grid):
     """Per-point RGB classification used by both backends.
 
-    Returns ``(colors_rgb, is_obs)`` where ``colors_rgb`` is an
-    (N, 3) float32 array with green for traversable, red for obstacle.
+    Returns ``(colors_rgb, is_obs)`` — green for traversable, red for
+    obstacle, gray for unclassified (point outside the local costmap
+    window or in a cell where PCA produced no result).
+
+    The colour reflects the algorithm's *final* per-cell decision
+    (``obs_grid``), which is also what feeds the global costmap and
+    A* planner. Earlier versions OR'd raw PCA slope into the colour
+    check, which disagreed with the costmap whenever the bleed-zone
+    or spike-override post-processing changed a cell's classification.
     """
     sim = _get_sim()
     gh2, gw2 = slope_grid.shape
@@ -454,15 +461,19 @@ def _classify_cloud_colors(cloud_s, origin, slope_grid, obs_grid):
     gx = ((dx + sim.COSTMAP_HALF) / sim.COSTMAP_RES).astype(int)
     gy = ((dy + sim.COSTMAP_HALF) / sim.COSTMAP_RES).astype(int)
     in_grid = (gx >= 0) & (gx < gw2) & (gy >= 0) & (gy < gh2)
-    is_obs = np.zeros(len(cloud_s), dtype=bool)
-    cell_slope = slope_grid[gy[in_grid], gx[in_grid]]
-    cell_obs = obs_grid[gy[in_grid], gx[in_grid]]
-    threshold = sim.TRAVERSABLE_MAX_DEG + sim.PCA_NOISE_MARGIN_DEG
-    is_obs[in_grid] = (cell_slope > threshold) | cell_obs
 
+    is_obs = np.zeros(len(cloud_s), dtype=bool)
+    is_obs[in_grid] = obs_grid[gy[in_grid], gx[in_grid]]
+
+    # Inside the local costmap, the colour mirrors what the planner sees:
+    # red wherever obs_grid says obstacle, green everywhere else (cells
+    # with no PCA result default to traversable in the planner too). Out-
+    # side the window we simply have no local data, so paint gray rather
+    # than misleadingly green.
     colors = np.empty((len(cloud_s), 3), dtype=np.float32)
-    colors[~is_obs] = (0.0, 0.82, 0.2)   # green = traversable
-    colors[is_obs] = (0.85, 0.0, 0.0)    # red = obstacle
+    colors[:] = (0.45, 0.45, 0.45)               # gray = no local data
+    colors[in_grid & ~is_obs] = (0.0, 0.82, 0.2) # green = traversable
+    colors[is_obs] = (0.85, 0.0, 0.0)            # red = obstacle
     return colors, is_obs
 
 
@@ -481,10 +492,14 @@ def update_3d_panel(view, state_or_none, cloud, origin, sn, slope_grid, obs_grid
     ``ThreeDState`` instance (kept for backward compat with the
     benchmark). For the GL path it can be None.
 
-    Coloring (matches the legacy mplot3d implementation):
-        red   — grade above (TRAVERSABLE_MAX_DEG + PCA_NOISE_MARGIN_DEG)
-                OR obs_grid[cell] is True
-        green — grade at/below threshold (traversable)
+    Coloring matches the algorithm's final per-cell decision (same
+    signal that drives the costmap + A* planner):
+        red   — ``obs_grid[cell]`` is True (wall, spike, DBSCAN cluster,
+                or PCA-steep not cleared by bleed-zone override)
+        green — point is inside the local costmap window and the cell
+                is traversable (matches the planner's view)
+        gray  — point is outside the local costmap window — no local
+                data, planner has no opinion on it yet
     """
     # Dispatch on the view type. ThreeDView / MockThreeDView use GL;
     # everything else (matplotlib axes) falls through to the legacy path.

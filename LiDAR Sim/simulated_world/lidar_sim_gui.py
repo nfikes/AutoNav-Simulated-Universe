@@ -898,6 +898,45 @@ class GlobalCostmap:
 
 # ── A* on global costmap ───────────────────────────────────────────
 
+def _closest_path_index_after(pts, start_i, x, y, window):
+    """Find the index of the closest point in ``pts`` to (x, y), searching
+    only ``[start_i, start_i + window]``. Path indices advance monotonically
+    once the agent has passed a point, so a forward-only search beats an
+    O(N) global scan and avoids "lock-onto-the-loop-back" failures when a
+    replanned path crosses itself."""
+    if not pts or start_i >= len(pts):
+        return max(0, len(pts) - 1)
+    end = min(len(pts), start_i + window)
+    best_i = start_i
+    best_d2 = float('inf')
+    for i in range(start_i, end):
+        dx = pts[i][0] - x
+        dy = pts[i][1] - y
+        d2 = dx * dx + dy * dy
+        if d2 < best_d2:
+            best_d2 = d2
+            best_i = i
+    return best_i
+
+
+def _look_ahead_point(pts, start_i, x, y, distance, goal_fallback):
+    """Walk ``pts`` forward from ``start_i`` until cumulative path
+    distance ≥ ``distance``, return that point as the pure-pursuit
+    carrot. Falls back to the last path point (or the goal) if the
+    path runs out before the look-ahead is reached."""
+    if not pts:
+        return goal_fallback if goal_fallback is not None else (x, y)
+    if start_i >= len(pts) - 1:
+        return pts[-1]
+    cum = 0.0
+    j = start_i
+    while j + 1 < len(pts) and cum < distance:
+        cum += float(np.hypot(pts[j + 1][0] - pts[j][0],
+                              pts[j + 1][1] - pts[j][1]))
+        j += 1
+    return pts[j]
+
+
 def _astar_raw(costmap, sx, sy, gx, gy):
     """Raw A* on the global costmap. Returns unsmoothed grid path.
 
@@ -1112,7 +1151,7 @@ def render_bev(new_obs, old_obs):
 # ── GUI ────────────────────────────────────────────────────────────
 
 class DualNavGUI:
-    def __init__(self, stl_path):
+    def __init__(self, stl_path, bake_mp4=None, bake_fps=60, bake_step=None):
         print("Loading mesh...")
         self.mesh=trimesh.load(stl_path)
         print(f"  {len(self.mesh.faces):,} faces")
@@ -1131,6 +1170,13 @@ class DualNavGUI:
         # Default start behind walls, goal past ramp 2
         self.default_start=(-1, -3.5)
         self.default_goal=(-0.5, 4.5)
+        # Offscreen-bake parameters. When ``bake_mp4`` is set the GUI skips
+        # ``app.exec_()`` after the initial scan and instead runs
+        # ``_bake_to_mp4`` to write a high-FPS MP4 of the agent traversing
+        # the planned path.
+        self.bake_mp4 = bake_mp4
+        self.bake_fps = bake_fps
+        self.bake_step = bake_step
         self._setup_gui()
 
     def _build_terrain(self):
@@ -1263,6 +1309,13 @@ class DualNavGUI:
         self.goal_mk.set_data([gx], [gy])
         self._do_scan(sx, sy)
         self._plan_paths()
+        # In bake mode, append a brief "(bake)" tag to the status that
+        # _plan_paths just set — the user already knows they're in bake
+        # mode (they clicked the button); G fires the offscreen bake the
+        # moment they're satisfied with the agent / goal placement.
+        if self.bake_mp4:
+            self.status.set_text(
+                self.status.get_text() + f"  ·  G = bake @ {self.bake_fps} fps")
         self.canvas.draw_idle()
 
         # Show the container and enter the Qt event loop. ``plt.show``
@@ -1270,8 +1323,7 @@ class DualNavGUI:
         # which would hide the GL view entirely.
         self.container.resize(1600, 700)
         self.container.show()
-        app = QtWidgets.QApplication.instance()
-        app.exec_()
+        QtWidgets.QApplication.instance().exec_()
 
     def _update_3d(self, cloud, origin, sn, slope_grid):
         """Update 3D point cloud panel via the shared sim_view helper.
@@ -1294,13 +1346,25 @@ class DualNavGUI:
         return float(np.arctan2(self.goal_pos[1] - py,
                                 self.goal_pos[0] - px))
 
-    def _heading_along(self, px, py, pts, i):
-        """Direction the agent is heading at this scan instant. Follows
-        the planned path: aims at the next waypoint in ``pts`` after
-        index ``i``, falling back to the goal bearing if the path has
-        been exhausted, then to 0 if neither is available."""
+    def _heading_along(self, px, py, pts, i, look_ahead_m=0.3):
+        """Direction the agent is heading at this scan instant. Looks
+        ``look_ahead_m`` metres ahead along the planned path so the
+        heading averages over A* grid staircases — a true diagonal in
+        the costmap shows up as alternating east / north single-cell
+        steps, and aiming at the very next waypoint would flip the
+        heading every cell. With FRONT_ARC_ONLY=True the lidar rays
+        are yaw-rotated by this heading; a flipping heading would
+        rotate the front arc 90° every cell-crossing and read as the
+        cloud "flipping back and forth" on the 3D panel.
+        """
         if pts and i + 1 < len(pts):
-            tx, ty = pts[i + 1]
+            cum = 0.0
+            j = i
+            while j + 1 < len(pts) and cum < look_ahead_m:
+                cum += float(np.hypot(pts[j + 1][0] - pts[j][0],
+                                       pts[j + 1][1] - pts[j][1]))
+                j += 1
+            tx, ty = pts[j]
         elif self.goal_pos is not None:
             tx, ty = self.goal_pos
         else:
@@ -1427,6 +1491,19 @@ class DualNavGUI:
                         "robot start or move the goal.")
                     self.canvas.draw_idle()
                     return
+            if self.bake_mp4:
+                # Bake-mode dispatch: capture the agent traversing the
+                # current plan to MP4 instead of running the live
+                # animation, then quit so the launcher shell returns.
+                self.animating = True
+                try:
+                    self._bake_to_mp4(self.bake_mp4, self.bake_fps,
+                                      step=self.bake_step)
+                finally:
+                    self.animating = False
+                from PyQt5 import QtWidgets
+                QtWidgets.QApplication.instance().quit()
+                return
             self._animate()
 
     def _resample(self,path,step):
@@ -1640,6 +1717,11 @@ class DualNavGUI:
                     if cs is not None and len(cs) > 3:
                         # ---- Tier A (always-on, algorithm-critical) ----
                         no, new_slope, Rn, ns = build_grade_costmap(cs, origin, sn)
+                        # _update_3d colors points by self.new_obs — keep
+                        # it in sync with the latest local scan so the 3D
+                        # cloud's red/green matches the cells the planner
+                        # just merged into the global costmap.
+                        self.new_obs = no
                         self.new_global.merge_local(no, origin, Rn, ns)
                         self.last_R = Rn; self.last_origin = origin
                         scan_tick_count += 1
@@ -1856,6 +1938,230 @@ class DualNavGUI:
         self.animating = False
         self.canvas.draw_idle()
 
+    def _bake_to_mp4(self, out_path, fps, step=None):
+        """Offscreen-render the agent traversing its planned path to MP4.
+
+        Mirrors the scan + replan cadence of ``_animate`` (SCAN_EVERY-meter
+        ticks) but skips Qt event pacing and idle-frame blits — every frame
+        is a full ``canvas.draw()`` so the encoded video stays crisp at the
+        requested fps. Grabs the full container (map + costmap overlay +
+        agent + planned path + 3D point cloud) at device-pixel resolution
+        so HiDPI displays bake at 2x.
+
+        ``step`` is the per-frame travel distance in metres. ``None``
+        auto-derives it so the on-screen speed matches the live animation
+        (which is paced for 15 fps at NAV_STEP=0.03 m/frame = 0.45 m/s):
+        ``step = NAV_STEP * 15 / fps``. At 60 fps that's 0.0075 m/frame,
+        giving 4x more frames than the live cadence and visibly smoother
+        sub-cell motion.
+        """
+        import imageio.v2 as imageio
+        from PyQt5 import QtGui, QtWidgets
+        out_path = str(out_path)
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        if not self.new_path:
+            print(f"[bake] No path planned — nothing to bake. "
+                  f"Default start/goal may be unreachable on this STL.")
+            return
+
+        # Per-frame travel: default keeps the live-mode on-screen speed.
+        if step is None or step <= 0:
+            step = NAV_STEP * 15.0 / float(fps)
+        bake_step = float(step)
+        # Arrival tolerance scales with the per-frame step so the agent
+        # always reaches the goal within a frame or two regardless of fps.
+        arrival_tol = max(NAV_STEP * 2.0, bake_step * 3.0)
+        print(f"[bake] step={bake_step*1000:.1f} mm/frame "
+              f"({bake_step * fps:.2f} m/s on screen)")
+
+        new_pts = self._resample(self.new_path, bake_step)
+        new_done = not new_pts
+
+        # ── Pure-pursuit kinematics ──
+        # The agent doesn't snap to ``new_pts[i]`` every frame; instead a
+        # unicycle model integrates position from velocity and heading
+        # from a rate-limited angular velocity. The planned path is the
+        # target — each frame we find the closest point on it, look
+        # ahead a small distance, and steer toward that point. This is
+        # what avoids the "instant 180° rotation" glitch: when a replan
+        # changes the path direction sharply, the agent rotates over
+        # multiple frames at ``omega_max`` instead of snapping.
+        v = bake_step * fps                # m/s (matches the previous
+                                            # bake's on-screen speed)
+        omega_max = 2.5                    # rad/s (~143°/s) — sharp
+                                            # enough to follow corners,
+                                            # smooth enough that no
+                                            # single frame snaps > a
+                                            # few degrees
+        look_ahead_m = 0.45                # pure-pursuit carrot distance
+        dt = 1.0 / float(fps)
+        # Search window for closest-point lookup on the path. With
+        # ``bake_step`` ~7.5 mm and the agent moving forward ≤ bake_step
+        # per frame, a 80-step window (~60 cm) is plenty.
+        closest_window = 80
+
+        phys_x, phys_y = self.robot_pos
+        # Seed heading at the look-ahead direction from the start so the
+        # first frame doesn't have to slew from 0.
+        _seed = _look_ahead_point(new_pts, 0, phys_x, phys_y,
+                                  look_ahead_m, self.goal_pos)
+        phys_heading = float(np.arctan2(_seed[1] - phys_y,
+                                         _seed[0] - phys_x))
+        last_closest_i = 0
+        # Distance travelled since the last scan tick (SCAN_EVERY gate).
+        phys_dist = SCAN_EVERY
+
+        # ── Headless once the bake starts ──
+        # Hiding the container removes it from macOS's compositor so the
+        # window server stops drawing it to the screen. The QOpenGLWidget
+        # keeps its GL context (it was initialized on first show), and
+        # ``container.grab()`` still composites the widget tree into the
+        # pixmap — we just skip painting to the visible display. Cuts
+        # ~15–25 ms / frame on retina.
+        self.container.hide()
+
+        def _grab_container_rgb():
+            """Composite the whole container (mpl canvas + GL panel) into
+            an RGB ndarray at device-pixel resolution.
+
+            Synchronous: ``canvas.draw()`` rasterizes the matplotlib
+            figure on this thread, and ``widget.repaint()`` forces the
+            QOpenGLWidget to paint immediately (no event-loop turn
+            needed). ``container.grab()`` then composites everything
+            into the pixmap. ``Format_RGBA8888`` is packed (no per-row
+            padding) so the numpy reshape works directly.
+            """
+            self.fig.canvas.draw()
+            self.three_d.widget.repaint()
+            pixmap = self.container.grab()
+            qimg = pixmap.toImage().convertToFormat(
+                QtGui.QImage.Format_RGBA8888)
+            w, h = qimg.width(), qimg.height()
+            try:
+                nbytes = qimg.sizeInBytes()
+            except AttributeError:
+                nbytes = qimg.byteCount()
+            ptr = qimg.constBits()
+            ptr.setsize(nbytes)
+            arr = np.frombuffer(ptr, dtype=np.uint8).reshape((h, w, 4))
+            return arr[:, :, :3].copy()
+
+
+        # Probe one frame to lock in dimensions for the writer. libx264
+        # wants even width/height; trim to the nearest even pixel.
+        probe = _grab_container_rgb()
+        h, w = probe.shape[:2]
+        even_w = w - (w % 2)
+        even_h = h - (h % 2)
+
+        writer = imageio.get_writer(
+            out_path,
+            fps=fps,
+            codec="libx264",
+            quality=8,           # imageio scale 0..10; 8 = visually crisp
+            macro_block_size=1,  # don't force a second dim trim
+        )
+        print(f"[bake] -> {out_path}  ({even_w}x{even_h} @ {fps} fps)")
+        t0 = time.perf_counter()
+        max_frames = 60 * 60 * fps  # 60-minute safety cap
+        frame_count = 0
+        try:
+            for _ in range(max_frames):
+                if new_done:
+                    break
+
+                # ── Pure-pursuit step ──
+                # Find closest point on the planned path, look ahead from
+                # there, slew heading toward the carrot at omega_max, and
+                # integrate position forward at v.
+                last_closest_i = _closest_path_index_after(
+                    new_pts, last_closest_i, phys_x, phys_y, closest_window)
+                carrot = _look_ahead_point(
+                    new_pts, last_closest_i, phys_x, phys_y,
+                    look_ahead_m, self.goal_pos)
+                target_heading = float(np.arctan2(
+                    carrot[1] - phys_y, carrot[0] - phys_x))
+                # Shortest signed angular difference in [-pi, pi].
+                err = ((target_heading - phys_heading + np.pi)
+                       % (2.0 * np.pi)) - np.pi
+                max_dtheta = omega_max * dt
+                if err > max_dtheta:
+                    err = max_dtheta
+                elif err < -max_dtheta:
+                    err = -max_dtheta
+                phys_heading += err
+                phys_x += v * dt * float(np.cos(phys_heading))
+                phys_y += v * dt * float(np.sin(phys_heading))
+                phys_dist += v * dt
+
+                nx, ny = phys_x, phys_y
+                self.new_mk.set_data([nx], [ny])
+                if last_closest_i < len(new_pts):
+                    self.new_path_line.set_data(
+                        [p[0] for p in new_pts[last_closest_i:]],
+                        [p[1] for p in new_pts[last_closest_i:]])
+
+                # Scan + classify every frame so the cloud, point colors,
+                # and 3D camera all track the moving agent at 60 fps.
+                # do_scan is ~3 ms with embreex; build_grade_costmap is
+                # ~15 ms. The heavier global-costmap merge + A* replan
+                # still fires only at the deployed SCAN_EVERY cadence so
+                # navigation behavior matches the real robot.
+                cs, origin, sn = do_scan(
+                    self.mesh, nx, ny, self.rays, phys_heading)
+                if cs is not None and len(cs) > 3:
+                    no, slope, R, seen = build_grade_costmap(cs, origin, sn)
+                    self.new_obs = no
+                    self.last_R = R; self.last_origin = origin
+                    self._update_3d(cs, origin, sn, slope)
+                    # Merge + replan on the deployed SCAN_EVERY cadence.
+                    if phys_dist >= SCAN_EVERY:
+                        phys_dist = 0.0
+                        self.new_global.merge_local(no, origin, R, seen)
+                        overlay = self.new_global.render_overlay()
+                        self.global_img.set_data(overlay)
+                        replanned = _astar_raw(
+                            self.new_global, nx, ny,
+                            self.goal_pos[0], self.goal_pos[1])
+                        if replanned and len(replanned) > 1:
+                            # Anchor at the agent's true position so the
+                            # transition between OLD and NEW path doesn't
+                            # introduce a cell-snap hop.
+                            anchored = [(nx, ny)] + list(replanned)
+                            new_pts = self._resample(anchored, bake_step)
+                            last_closest_i = 0
+                            self.new_path_line.set_data(
+                                [p[0] for p in new_pts],
+                                [p[1] for p in new_pts])
+
+                # Arrival check (distance from physical position to goal).
+                if self.goal_pos is not None:
+                    d = float(np.hypot(nx - self.goal_pos[0],
+                                       ny - self.goal_pos[1]))
+                    if d < arrival_tol:
+                        new_done = True
+
+                self.status.set_text(
+                    f"Bake: frame {frame_count + 1} | "
+                    f"pos ({nx:.1f},{ny:.1f}) "
+                    f"h {np.degrees(phys_heading):+.0f}°")
+
+                frame = _grab_container_rgb()
+                writer.append_data(frame[:even_h, :even_w, :])
+                frame_count += 1
+                if frame_count % fps == 0:
+                    secs = frame_count / fps
+                    elapsed = time.perf_counter() - t0
+                    print(f"[bake]   {frame_count:5d} frames "
+                          f"({secs:5.1f}s video, {elapsed:5.1f}s wall)",
+                          flush=True)
+        finally:
+            writer.close()
+        wall = time.perf_counter() - t0
+        secs = frame_count / fps if fps else 0.0
+        print(f"[bake] Done: {frame_count} frames "
+              f"({secs:.1f}s video) in {wall:.1f}s wall -> {out_path}")
+
 def main():
     import argparse
     global GRADE_FREE_MAX, GRADE_MODERATE_MAX, GRADE_STEEP_MAX, TRAVERSABLE_MAX_DEG, N_RAYS
@@ -1875,6 +2181,19 @@ def main():
              f"Use a smaller value (~2000) on Windows-native Python "
              f"where trimesh has no embree and 10000 rays is glacial.")
     parser.add_argument(
+        "--bake-mp4", type=str, default=None,
+        help="Render the agent traversing the planned path to this MP4 path "
+             "instead of opening an interactive window. Captures the map + "
+             "costmap overlay + path at --bake-fps frames/sec.")
+    parser.add_argument(
+        "--bake-fps", type=int, default=60,
+        help="Frames per second for --bake-mp4 output (default 60).")
+    parser.add_argument(
+        "--bake-step", type=float, default=None,
+        help="Per-frame agent travel in metres for --bake-mp4. "
+             "Default auto-derives so on-screen speed matches the live "
+             "animation: NAV_STEP * 15 / fps (= 0.0075 m at 60 fps).")
+    parser.add_argument(
         "stl", nargs="?", default=STL_PATH,
         help="Optional path to a different STL.")
     args = parser.parse_args()
@@ -1891,6 +2210,37 @@ def main():
     TRAVERSABLE_MAX_DEG = deg
     print(f"== PCA grade tolerance: {args.threshold}% (TRAVERSABLE_MAX_DEG={deg} deg) ==")
     print(f"   pass slopes <= {deg:.1f} deg, block slopes > {deg:.1f} deg + {PCA_NOISE_MARGIN_DEG} deg margin")
-    DualNavGUI(args.stl)
+    _warn_if_slow_raycaster(args.rays)
+    DualNavGUI(args.stl, bake_mp4=args.bake_mp4, bake_fps=args.bake_fps,
+               bake_step=args.bake_step)
+
+
+def _warn_if_slow_raycaster(n_rays):
+    """Detect whether trimesh picked up an Embree-backed ray intersector.
+
+    Without Embree, a single 11 520-ray scan on a 300k-face mesh takes ~2 min
+    on Apple Silicon — looks like the sim is frozen. Print a clear, OS-aware
+    install hint so the user doesn't think the GUI hung."""
+    import platform
+    try:
+        import trimesh as _tm
+        _probe = _tm.Trimesh(vertices=[[0,0,0],[1,0,0],[0,1,0]], faces=[[0,1,2]])
+        backend = type(_probe.ray).__module__
+    except Exception:
+        backend = "unknown"
+    if "pyembree" in backend or "embree" in backend:
+        print(f"   raycaster: {backend} (fast)")
+        return
+    sysname = platform.system()
+    hint = {
+        "Darwin":  "pip install embreex   # Apple Silicon + Intel macOS",
+        "Linux":   "pip install embreex",
+        "Windows": "pip install embreex",
+    }.get(sysname, "pip install embreex")
+    print(f"[WARN] trimesh is using the pure-Python ray intersector ({backend}).")
+    print(f"       A {n_rays}-ray scan on this mesh will take ~{max(1, n_rays // 250)} s each;")
+    print(f"       the GUI will look frozen during the first scan.")
+    print(f"       Install the Embree backend for ~1000x speedup:")
+    print(f"         {hint}")
 
 if __name__=="__main__": main()

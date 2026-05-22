@@ -7,7 +7,7 @@ Two modes:
                          (scripts/test_ramp_crossing.py)
 """
 
-import subprocess
+import os
 import sys
 from pathlib import Path
 
@@ -18,6 +18,8 @@ HERE = Path(__file__).resolve().parent
 GUI_SCRIPT = HERE / "lidar_sim_gui.py"
 BENCH_SCRIPT = HERE / "scripts" / "test_ramp_crossing.py"
 ASSETS_DIR = HERE.parent / "3d_assets"
+BAKES_DIR = HERE / "bakes"
+BAKE_FPS = 60
 
 
 MODES = [
@@ -181,14 +183,20 @@ class LauncherWindow(QtWidgets.QWidget):
         buttons = QtWidgets.QHBoxLayout()
         buttons.addStretch(1)
         self.cancel_btn = QtWidgets.QPushButton("Cancel")
+        self.bake_btn = QtWidgets.QPushButton("Bake MP4…")
+        self.bake_btn.setToolTip(
+            "Render the agent traversing the default path to an MP4 at "
+            "60 fps (GUI mode only). Skips the interactive window.")
         self.launch_btn = QtWidgets.QPushButton("Launch")
         self.launch_btn.setDefault(True)
         buttons.addWidget(self.cancel_btn)
+        buttons.addWidget(self.bake_btn)
         buttons.addWidget(self.launch_btn)
         root.addLayout(buttons)
 
         self.cancel_btn.clicked.connect(self.close)
         self.launch_btn.clicked.connect(self._launch)
+        self.bake_btn.clicked.connect(self._bake)
 
         for w in self.findChildren(QtWidgets.QAbstractButton):
             w.toggled.connect(self._refresh)
@@ -226,6 +234,10 @@ class LauncherWindow(QtWidgets.QWidget):
         is_gui = self._selected_mode() == "gui"
         self.stl_box.setVisible(is_gui)
         self.bench_box.setVisible(not is_gui)
+        # The MP4 bake walks the GUI mode's default path; the ramp
+        # benchmark already exports its own gif, so hide the button there
+        # to avoid implying a second video format is available.
+        self.bake_btn.setVisible(is_gui)
         self._refresh()
 
     def _build_args(self):
@@ -256,11 +268,48 @@ class LauncherWindow(QtWidgets.QWidget):
                   else BENCH_SCRIPT)
         argv = [sys.executable, str(target)] + self._build_args()
         self.close()
+        # Replace this process with the sim. Popen would detach the child;
+        # on macOS that lets the sim die silently if the bash wrapper / Terminal
+        # tear down before the child is fully up.
+        os.chdir(str(HERE))
         try:
-            subprocess.Popen(argv, cwd=str(HERE))
+            os.execvp(argv[0], argv)
         except OSError as exc:
             QtWidgets.QMessageBox.critical(
                 None, "Launch failed", f"Could not start sim:\n{exc}")
+            sys.exit(1)
+
+    def _bake(self):
+        """Save dialog -> exec GUI script with --bake-mp4 PATH.
+
+        Only enabled in GUI mode (see ``_on_mode_changed``)."""
+        from datetime import datetime
+        BAKES_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_path = str(BAKES_DIR / f"lidar_sim_{stamp}.mp4")
+        out_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Bake MP4", default_path, "MP4 video (*.mp4);;All files (*)")
+        if not out_path:
+            return
+        if not out_path.lower().endswith(".mp4"):
+            out_path += ".mp4"
+        # Reuse the GUI flag set (threshold, rays, optional STL) and append
+        # the bake-mode flags. The chosen STL still applies — bake renders
+        # the same map the interactive Launch would.
+        gui_args = ["--threshold", str(self._selected_threshold()),
+                    "--rays",      str(self._selected_rays()),
+                    "--bake-mp4",  out_path,
+                    "--bake-fps",  str(BAKE_FPS)]
+        if self.stl_cb.isChecked() and self.stl_path.text().strip():
+            gui_args.append(self.stl_path.text().strip())
+        argv = [sys.executable, str(GUI_SCRIPT)] + gui_args
+        self.close()
+        os.chdir(str(HERE))
+        try:
+            os.execvp(argv[0], argv)
+        except OSError as exc:
+            QtWidgets.QMessageBox.critical(
+                None, "Bake failed", f"Could not start bake:\n{exc}")
             sys.exit(1)
 
 
