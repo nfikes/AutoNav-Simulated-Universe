@@ -11,11 +11,68 @@ __pycache__/
 .DS_Store
 ._*
 
-# Heavy local data — kept on disk, never committed
+# ─── Heavy local data / generated outputs ────────────────────────
+# Bake outputs (the simulators dump MP4 / GIF playbacks here).
+# ``**/bakes/`` covers nested per-sim bakes folders.
 Baked_Playbacks/
 bakes/
+**/bakes/
 example-playback-csv/
 tile_cache/
+
+# Generated media. The simulators write benchmark GIFs / preview
+# MP4s into result directories during dev — they're hundreds of MB
+# of regenerable artifacts, never useful in git history.
+*.mp4
+*.gif
+**/benchmark_results/
+
+# Ad-hoc test / script outputs (per-experiment images next to the
+# script that produced them).
+**/scripts/test_*.png
+**/scripts/test_*.gif
+
+# Per-run empirical-results dumps (CSVs are kept — they're the
+# source of truth; PNG renders next to them are regenerable).
+**/data/empirical_results/*.png
+
+# Terrain cache files. lidar_sim_gui.py ray-casts the STL once and
+# saves a 16-bit ``*.terrain.png`` / ``*.test_terrain.png`` next to
+# it as a precomputed elevation/shading cache; subsequent runs load
+# instantly. Regenerated on demand whenever the cache is missing
+# or older than the STL, so it never needs to live in git.
+**/3d_assets/*.terrain.png
+**/3d_assets/*.test_terrain.png
+
+# ROS bag recordings. The GUI sim's recording mode dumps a
+# ``manual_<timestamp>/`` directory per session containing a 280+ MB
+# ``.db3`` SQLite bag, plus camera/lidar/costmap captures. These are
+# session artifacts, never source-of-truth.
+*.bag
+*.db3
+*.mcap
+**/bag/metadata.yaml
+
+# NumPy serialised arrays. The LiDAR sim writes ``*.npy`` /
+# ``*.npz`` cache files next to STLs (e.g. ``*.spawn_mask.npy``,
+# ``*_costmap.npz``) and inside ``data/manual_*/`` recording dirs.
+# All are regenerable on demand.
+*.npy
+*.npz
+
+# ``generate_grade_map.py`` defaults its PNG outputs into the script
+# directory. List the known output names so they don't accidentally
+# slip in alongside source.
+**/scripts/grade_map.png
+**/scripts/slope_raw.png
+**/scripts/slope_*.png
+
+# Whole GUI Sim recording-session folders. Match anything under a
+# ``manual_<...>/`` directory inside ``GUI Sim/data/`` (the recorder
+# names them with a timestamp). Catches everything the recorder
+# writes per session in one rule.
+GUI Sim/data/manual_*/
+**/data/manual_*/
 
 # Editor / Claude local state
 .claude/settings.local.json

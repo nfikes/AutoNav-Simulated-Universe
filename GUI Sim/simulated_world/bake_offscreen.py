@@ -392,9 +392,12 @@ class PlotRenderers:
         self.lidar_title = lidar_title
         self.gps_title = gps_title
         self.odom_title = odom_title
-        # costmap is None or dict {'data', 'shape', 'resolution', 'origin'};
-        # render_odom crops a ±3 m window dynamically per output frame.
-        self._costmap = costmap
+        # costmap is None or the full snapshot collection. _active_costmap
+        # is set per frame by render_odom to the snapshot whose timestamp
+        # bracket contains target_ns (see worker_render_chunk).
+        self._costmap_collection = costmap
+        self._active_costmap = None
+        self._active_extent = None
         self._odom_scatter = None
         self._odom_tri = None
         # Persistent artists for the tier upgrades. Created on first use
@@ -619,8 +622,10 @@ class PlotRenderers:
                 self._gps_cov_ellipse.set_visible(False)
         return fig_to_array(self._gps_fig)
 
-    def render_odom(self, data):
+    def render_odom(self, data, active_costmap=None):
         xs, ys, thetas = data['odom_x'], data['odom_y'], data['odom_theta']
+        self._active_costmap = active_costmap
+        self._active_extent = None
         if self._odom_scatter is not None:
             self._odom_scatter.remove()
             self._odom_scatter = None
@@ -647,8 +652,23 @@ class PlotRenderers:
         self._odom_scatter = self._odom_ax.scatter(
             xs_d, ys_d, c=colors, cmap='coolwarm', s=4, zorder=3)
 
+        # Render the costmap crop first so we can fold its extent into
+        # the view bounds — matches hud_node._live_tick lines 7621-7637
+        # where cm_extent expands min_x/max_x before the limits are set.
+        cx, cy = xs[-1], ys[-1]
+        if active_costmap is not None:
+            self._render_costmap_crop(cx, cy)
+        elif self._odom_costmap_im is not None:
+            self._odom_costmap_im.set_visible(False)
+
         min_x, max_x = min(xs), max(xs)
         min_y, max_y = min(ys), max(ys)
+        if self._active_extent is not None:
+            ex0, ex1, ey0, ey1 = self._active_extent
+            min_x = min(min_x, ex0)
+            max_x = max(max_x, ex1)
+            min_y = min(min_y, ey0)
+            max_y = max(max_y, ey1)
         span = max(max_x - min_x, max_y - min_y) * 1.3
         span = max(span, 1.0)
         half = span / 2
@@ -673,16 +693,7 @@ class PlotRenderers:
             dist = 0.0
         self._odom_dist_label.set_text(f"Dist: {dist:.2f} m")
 
-        cx, cy = xs[-1], ys[-1]
         theta = thetas[-1] if thetas else 0.0
-
-        # ── Tier 3 visual: ±3 m costmap crop centred on current pose ──
-        # The live GUI does the exact same crop in _cb_global_costmap so the
-        # global costmap renders local-sized under the red triangle.
-        if self._costmap is not None:
-            self._render_costmap_crop(cx, cy)
-        elif self._odom_costmap_im is not None:
-            self._odom_costmap_im.set_visible(False)
 
         # ── Tier visual (independent): green /plan line overlay ──
         plan_xy = data.get('plan_xy')
@@ -710,11 +721,15 @@ class PlotRenderers:
         return fig_to_array(self._odom_fig)
 
     def _render_costmap_crop(self, rx, ry, crop_half=3.0):
-        """Crop a ±crop_half-metre window around (rx, ry) from the persistent
-        global costmap snapshot and draw it under the odom trail. Mirrors
+        """Crop a ±crop_half-metre window around (rx, ry) from the currently
+        active costmap snapshot and draw it under the odom trail. Mirrors
         the cropping/colour-mapping logic in hud_node._cb_global_costmap.
+        Also records the crop's metre-extent on self._active_extent so the
+        outer render_odom expands the view to include it.
         """
-        cm = self._costmap
+        cm = self._active_costmap
+        if cm is None:
+            return
         h = int(cm['shape'][0])
         w = int(cm['shape'][1])
         res = float(cm['resolution'])
@@ -758,6 +773,7 @@ class PlotRenderers:
             self._odom_costmap_im.set_data(rgba)
             self._odom_costmap_im.set_extent(extent)
             self._odom_costmap_im.set_visible(True)
+        self._active_extent = extent
 
     def render_power(self, key, data):
         fig = self._pwr_figs[key]
@@ -944,10 +960,15 @@ def worker_render_chunk(args):
     last_gps_len = -1
     last_odom_len = -1
     last_pwr_len = -1
+    last_costmap_i = -2  # -2 so the first frame always triggers a redraw
     cached_gps = None
     cached_odom = None
     cached_pwr = {}
     ema_eta_hours = None  # EMA-smoothed ETA estimate
+
+    # Precompute costmap snapshot timestamps for O(log n) selection per
+    # frame. `costmap_ts` is None when no costmap was captured.
+    costmap_ts = costmap['timestamps'] if costmap is not None else None
 
     for frame_i in range(frame_start, frame_end):
         target_ns = int((frame_i / BAKE_FPS) * 1e9)
@@ -987,13 +1008,34 @@ def worker_render_chunk(args):
             cached_gps = renderers.render_gps(data)
             last_gps_len = gl
 
-        # Odom: re-render when trail grew OR a plan/costmap is fresh
-        # (plan + costmap can change between odom samples).
+        # Resolve the active costmap snapshot — most-recent publish at or
+        # before target_ns. Returns -1 (no snapshot yet) until the first
+        # /global_costmap/costmap message lands.
+        active_costmap = None
+        active_costmap_i = -1
+        if costmap_ts is not None and len(costmap_ts) > 0:
+            i = int(np.searchsorted(costmap_ts, target_ns, side='right')) - 1
+            if i >= 0:
+                start = int(costmap['data_offsets'][i])
+                end = int(costmap['data_offsets'][i + 1])
+                active_costmap = {
+                    'data': costmap['data_flat'][start:end],
+                    'shape': costmap['shapes'][i],
+                    'resolution': float(costmap['resolutions'][i]),
+                    'origin': costmap['origins'][i],
+                }
+                active_costmap_i = i
+
+        # Odom: re-render when trail grew OR a plan/costmap is fresh OR
+        # the active costmap snapshot changed (its extent + cropped data
+        # both shift the view).
         ol = len(data['odom_x'])
         plan_fresh = data.get('plan_xy') is not None
-        if ol != last_odom_len or plan_fresh or costmap is not None:
-            cached_odom = renderers.render_odom(data)
+        if (ol != last_odom_len or plan_fresh
+                or active_costmap_i != last_costmap_i):
+            cached_odom = renderers.render_odom(data, active_costmap)
             last_odom_len = ol
+            last_costmap_i = active_costmap_i
 
         # Power: always re-render — rolling window content shifts every frame
         for k in ('V', 'I', 'P'):
@@ -1094,20 +1136,48 @@ def main():
     print(f"Panel titles: cam={cam_title!r} lidar={lidar_title!r} "
           f"gps={gps_title!r} odom={odom_title!r}", flush=True)
 
-    # Load the costmap snapshot once (it's tiny — a few KB). Workers
-    # receive it via the args tuple; matplotlib creates the imshow once
-    # per worker and the crop is updated per output frame.
+    # Load the costmap snapshots. The npz can be either:
+    #   v2 (multi-snapshot)  — timestamps + flat data buffer, indexed
+    #                          per frame so the overlay evolves with
+    #                          the bag.
+    #   v1 (single snapshot) — legacy schema with one `data`/`shape`/
+    #                          `resolution`/`origin` array. Wrapped as
+    #                          a one-snapshot collection at ts=0.
     costmap = None
     if meta.get('has_costmap') and os.path.isfile(costmap_path):
         try:
             cm = np.load(costmap_path)
-            costmap = {
-                'data': cm['data'],
-                'shape': cm['shape'],
-                'resolution': float(cm['resolution']),
-                'origin': cm['origin'],
-            }
-            print(f"Loaded costmap snapshot from {costmap_path}", flush=True)
+            if 'timestamps' in cm.files:
+                shapes = np.asarray(cm['shapes'], dtype=np.int32)
+                offsets = np.asarray(cm['data_offsets'], dtype=np.int64)
+                data_flat = np.asarray(cm['data_flat'], dtype=np.int8)
+                costmap = {
+                    'timestamps': np.asarray(cm['timestamps'], dtype=np.int64),
+                    'shapes': shapes,
+                    'resolutions': np.asarray(cm['resolutions'], dtype=np.float32),
+                    'origins': np.asarray(cm['origins'], dtype=np.float32),
+                    'data_offsets': offsets,
+                    'data_flat': data_flat,
+                }
+                print(f"Loaded {len(costmap['timestamps'])} costmap "
+                      f"snapshot(s) from {costmap_path}", flush=True)
+            else:
+                # Legacy single-snapshot npz — wrap into the same schema
+                # so worker code only handles one path.
+                shape = np.asarray(cm['shape'], dtype=np.int32)
+                h, w = int(shape[0]), int(shape[1])
+                data = np.asarray(cm['data'], dtype=np.int8).reshape(-1)
+                costmap = {
+                    'timestamps': np.zeros(1, dtype=np.int64),
+                    'shapes': shape.reshape(1, 2),
+                    'resolutions': np.array(
+                        [float(cm['resolution'])], dtype=np.float32),
+                    'origins': np.asarray(cm['origin'], dtype=np.float32).reshape(1, 2),
+                    'data_offsets': np.array([0, h * w], dtype=np.int64),
+                    'data_flat': data,
+                }
+                print(f"Loaded legacy single costmap snapshot from "
+                      f"{costmap_path}", flush=True)
         except (OSError, ValueError, KeyError) as e:
             print(f"WARN: could not load costmap {costmap_path}: {e}",
                   flush=True)

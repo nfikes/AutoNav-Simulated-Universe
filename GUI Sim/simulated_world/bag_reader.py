@@ -674,7 +674,12 @@ def extract_bag(bag_dir, out_dir=None, fps=DEFAULT_FPS, force=False, verbose=Tru
     # Plan + costmap presence — set as messages arrive; drives the
     # odom-panel title in the bake.
     has_plan_msgs = False
-    latest_costmap = None  # dict or None — see /global_costmap branch
+    # All costmap snapshots seen during the bag, in publish order.
+    # Each entry is the OccupancyGrid info + raw int8 data + the bag
+    # timestamp (ns). The bake selects the most-recent snapshot per
+    # frame so the costmap evolves during playback the same way the
+    # live GUI's _cb_global_costmap updates it.
+    costmap_snaps = []  # list[dict]
 
     def _ts_for_idx(idx):
         return start_ns + int(idx * 1e9 / fps)
@@ -818,20 +823,22 @@ def extract_bag(bag_dir, out_dir=None, fps=DEFAULT_FPS, force=False, verbose=Tru
                 print(f'WARN: {topic}: {e}', file=sys.stderr)
             continue
 
-        # /global_costmap/costmap — keep the LATEST snapshot (cost-maps
-        # update at ~1-2 Hz and the bake renders a static crop centred
-        # on the live robot pose, so per-frame storage would be wasteful).
+        # /global_costmap/costmap — store every snapshot so the bake can
+        # show the costmap building up over time. Snapshots are ~10-20 KB
+        # of int8 at typical map_padder corridor sizes (140x130 cells), so
+        # 5 min of 2 Hz data is well under 10 MB and trivial to compress.
         if (topic == _COSTMAP_TOPIC
                 and msgtype == 'nav_msgs/msg/OccupancyGrid'):
             try:
-                latest_costmap = {
+                costmap_snaps.append({
+                    'ts_ns': int(ts_ns),
                     'height': int(msg.info.height),
                     'width': int(msg.info.width),
                     'resolution': float(msg.info.resolution),
                     'origin_x': float(msg.info.origin.position.x),
                     'origin_y': float(msg.info.origin.position.y),
                     'data': np.asarray(msg.data, dtype=np.int8).copy(),
-                }
+                })
             except Exception as e:  # noqa: BLE001
                 print(f'WARN: {topic}: {e}', file=sys.stderr)
             continue
@@ -901,7 +908,7 @@ def extract_bag(bag_dir, out_dir=None, fps=DEFAULT_FPS, force=False, verbose=Tru
     # snapshot to render (the bake centres the costmap crop on the EKF
     # pose). If the bag has a costmap but no EKF the tier collapses to
     # "ekf" — same rule the live GUI applies via the costmap-stale gate.
-    has_costmap = latest_costmap is not None
+    has_costmap = len(costmap_snaps) > 0
     if has_ekf and has_costmap:
         odom_tier = 'ekf_costmap'
     elif has_ekf:
@@ -937,41 +944,64 @@ def extract_bag(bag_dir, out_dir=None, fps=DEFAULT_FPS, force=False, verbose=Tru
         print(f'WARN: could not write meta sidecar {meta_path}: {e}',
               file=sys.stderr)
 
-    # Costmap snapshot (the latest one seen). Stored as a separate npz
-    # so the bake can mmap-load it once and crop dynamically per output
-    # frame. We keep raw int8 data + the OccupancyGrid origin/resolution
-    # metadata so the bake can map cell coords → metres without extra
-    # bookkeeping.
-    if latest_costmap is not None:
+    # Re-base timestamps to start at 0 and sort. The costmap snapshots
+    # below get the same shift so they share the bake's relative timeline.
+    rows.sort(key=lambda r: r[0])
+    t0 = rows[0][0] if rows else 0
+    if rows:
+        rows = [(ts - t0, t, k, v) for (ts, t, k, v) in rows]
+
+    # Costmap snapshots: every /global_costmap/costmap message from the
+    # bag is preserved with its relative timestamp. The bake selects the
+    # most-recent snapshot per output frame, so the cost overlay updates
+    # during playback (matching the live GUI's _cb_global_costmap loop).
+    # Layout in the npz is flat to avoid object-dtype arrays:
+    #   timestamps[N]    int64    publish ns, relative to row t0
+    #   shapes[N,2]      int32    (h, w) per snapshot
+    #   resolutions[N]   float32  metres/cell
+    #   origins[N,2]     float32  (ox, oy) metres
+    #   data_offsets[N+1] int64   start index of each snapshot in data_flat
+    #   data_flat[total] int8     concatenated OccupancyGrid cells
+    if costmap_snaps:
         costmap_path = os.path.join(stem_dir, f'{stem_name}_costmap.npz')
         try:
+            n = len(costmap_snaps)
+            timestamps = np.array(
+                [s['ts_ns'] - t0 for s in costmap_snaps], dtype=np.int64)
+            shapes = np.array(
+                [[s['height'], s['width']] for s in costmap_snaps],
+                dtype=np.int32)
+            resolutions = np.array(
+                [s['resolution'] for s in costmap_snaps], dtype=np.float32)
+            origins = np.array(
+                [[s['origin_x'], s['origin_y']] for s in costmap_snaps],
+                dtype=np.float32)
+            sizes = [int(s['height']) * int(s['width']) for s in costmap_snaps]
+            data_offsets = np.zeros(n + 1, dtype=np.int64)
+            data_offsets[1:] = np.cumsum(sizes)
+            data_flat = np.empty(int(data_offsets[-1]), dtype=np.int8)
+            for i, s in enumerate(costmap_snaps):
+                start, end = int(data_offsets[i]), int(data_offsets[i + 1])
+                data_flat[start:end] = s['data'][:end - start]
             np.savez_compressed(
                 costmap_path,
-                data=latest_costmap['data'],
-                shape=np.array(
-                    [latest_costmap['height'], latest_costmap['width']],
-                    dtype=np.int32,
-                ),
-                resolution=np.float32(latest_costmap['resolution']),
-                origin=np.array(
-                    [latest_costmap['origin_x'], latest_costmap['origin_y']],
-                    dtype=np.float32,
-                ),
+                version=np.int32(2),
+                timestamps=timestamps,
+                shapes=shapes,
+                resolutions=resolutions,
+                origins=origins,
+                data_offsets=data_offsets,
+                data_flat=data_flat,
             )
             if verbose:
-                print(f'extract_bag: wrote latest costmap snapshot to '
-                      f'{costmap_path} ({latest_costmap["width"]}x'
-                      f'{latest_costmap["height"]} cells @ '
-                      f'{latest_costmap["resolution"]} m/cell)')
+                last = costmap_snaps[-1]
+                print(f'extract_bag: wrote {n} costmap snapshot(s) to '
+                      f'{costmap_path} (latest {last["width"]}x'
+                      f'{last["height"]} cells @ {last["resolution"]} '
+                      f'm/cell)')
         except OSError as e:
             print(f'WARN: could not write costmap snapshot {costmap_path}: '
                   f'{e}', file=sys.stderr)
-
-    # Re-base timestamps to start at 0 and sort.
-    rows.sort(key=lambda r: r[0])
-    if rows:
-        t0 = rows[0][0]
-        rows = [(ts - t0, t, k, v) for (ts, t, k, v) in rows]
 
     max_cols = _scan_for_max_value_cols(rows)
     header = _csv_header(max_value_cols=max_cols)

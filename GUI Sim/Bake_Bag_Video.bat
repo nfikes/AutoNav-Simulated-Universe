@@ -16,7 +16,7 @@ REM File picker: CSV (extracted playback) OR .db3 / metadata.yaml (raw rosbag2)
 for /f "usebackq delims=" %%I in (`powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "Add-Type -AssemblyName System.Windows.Forms;" ^
   "$f = New-Object System.Windows.Forms.OpenFileDialog;" ^
-  "$f.InitialDirectory = '%ROOT%data\example-playback-csv';" ^
+  "$f.InitialDirectory = (@('%ROOT%data\example-playback-csv','%ROOT%data','%ROOT%') | Where-Object { Test-Path $_ } | Select-Object -First 1);" ^
   "$f.Filter = 'Bake input (*.csv;*.db3;metadata.yaml)|*.csv;*.db3;metadata.yaml|Playback CSV (*.csv)|*.csv|ROS bag (*.db3)|*.db3|Bag manifest (metadata.yaml)|metadata.yaml|All files (*.*)|*.*';" ^
   "$f.Title = 'Pick a playback CSV or a rosbag2 .db3 / metadata.yaml';" ^
   "if ($f.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $f.FileName }"`) do (

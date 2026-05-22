@@ -16,6 +16,9 @@ fi
 # File picker: CSV (extracted playback) OR .db3 / metadata.yaml (raw rosbag2)
 INITIAL_DIR="$ROOT/data/example-playback-csv"
 if [ ! -d "$INITIAL_DIR" ]; then
+    INITIAL_DIR="$ROOT/data"
+fi
+if [ ! -d "$INITIAL_DIR" ]; then
     INITIAL_DIR="$ROOT"
 fi
 

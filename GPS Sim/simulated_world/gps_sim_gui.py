@@ -59,7 +59,7 @@ try:
 except Exception:
     pass  # fall back to whatever backend is active (e.g. headless Agg)
 import matplotlib.pyplot as plt
-from matplotlib.patches import Circle, Rectangle, Polygon, Patch
+from matplotlib.patches import Circle, Rectangle, Polygon, Patch, Ellipse
 from matplotlib.markers import MarkerStyle
 from matplotlib.lines import Line2D
 from matplotlib.collections import LineCollection
@@ -284,11 +284,74 @@ THRUST_KP     = 4.0                          # P-gain on velocity error
 # stationary jitter < 10 cm, one ~10 m discontinuity per 200 s.)
 GPS_SAMPLE_HZ = 10.0
 GPS_PERIOD    = 1.0 / GPS_SAMPLE_HZ          # 0.1 s
+# ── Launch-stack subsystem toggles ───────────────────────────────────
+# Each models whether a specific ROS2 launch-stack package is up. When
+# OFF, the corresponding sim behavior is gated so the user can
+# reproduce / diagnose what happens to navigation when that node fails
+# to start. Mirror in the launcher panel and in `main()`'s argparse.
+GPS_RECEIVER_ENABLE     = True   # /gps_fix publisher (the GPS itself)
+NAV2_PLANNING_ENABLE    = True   # A* path planning (nav2 lifecycle up)
+# Note: GPS_HEADING_EKF_ENABLE, LIDAR_IMU_FUSION_ENABLE, and
+# GPS_LEVER_ARM_CORRECTION_ENABLE are defined below — they're the
+# pre-existing toggles that the launcher's "Stack" group also exposes.
+
+# ── Last-resort GPS-anchored fallback (mid-mission EKF degradation)
+# Assumption: at mission start both local and global EKF are healthy.
+# If, during the run, the EKF stops tracking truth — e.g. the local
+# EKF rejects too many GPS updates in a row, or the new goal-distance
+# magnitude invariant catches a virtual↔real translation — the
+# algorithm can switch its candidate-placement anchor from
+# ``ekf.pos_xy`` to ``latest_gps``. The candidate then becomes
+#     candidate_odom = self.odom + R(-θ_closed_form) · (goal − GPS)
+# and is republished every tick. The robot's NAV2 drives toward it
+# in odom frame; the next GPS read tells us where the robot actually
+# went, and the candidate moves to compensate. Closed-loop GPS
+# feedback corrects for the encoder yaw bias automatically — no
+# need to know K · D explicitly, because the candidate is re-anchored
+# on real position every tick.
+#
+# Constraints this respects:
+#   • The algorithm cannot control the robot; it can only PUBLISH
+#     candidate goals in the robot's odom frame. NAV2 owns the
+#     low-level controller.
+#   • The fallback uses ONLY data the gps_handler_node already has:
+#     /gps_fix, gps_history (for closed-form θ), self.odom.
+#   • Engagement is one-way (no re-engagement of EKF) so the
+#     candidate doesn't oscillate between two anchor sources.
+#
+# Limitations:
+#   • Requires GPS itself to be reliable. If GPS is spoofed / jammed,
+#     no fallback helps — the INV_MAG_RATIO watchdog catches that
+#     case and the right response is to abort, not to fall further.
+#   • The trajectory under fallback is a curve (encoder bias bends
+#     it; GPS feedback un-bends it). Approach time is longer than
+#     a healthy EKF run.
+GPS_FALLBACK_ENABLE     = True   # feature available
+GPS_FALLBACK_TRIGGER_GOAL_DIST_FIRES = 1
+                                  # engage after this many sustained
+                                  # goal-distance watchdog fires
+GPS_FALLBACK_TRIGGER_EKF_REJECTS = 8
+                                  # OR after this many consecutive
+                                  # EKF GPS rejects (lock-in recovery
+                                  # threshold's hint that the EKF has
+                                  # stopped tracking truth)
+
 GPS_NOISE_STD = 0.30                         # white noise σ (m)
 # Slow correlated drift (ionosphere / multipath). Modelled as an
 # elliptical sinusoid with random phase and per-session axis.
 GPS_BIAS_AMPL_M    = 0.5
 GPS_BIAS_PERIOD_S  = 60.0
+# Per-agent fixed mean bias. Models installation-specific multipath /
+# antenna placement / receiver clock offsets that are constant for a
+# given GPS unit. Unlike ``GPS_BIAS_AMPL_M`` (which cycles and is
+# zero-mean over a period), this offset stays put for the agent's
+# entire session — exactly the type of error the 3-state EKF cannot
+# observe out because it's indistinguishable from "the world frame is
+# shifted." Magnitude is drawn uniformly from [0, GPS_MEAN_BIAS_M] per
+# agent; direction is uniform on [0, 2π). Default 0 = disabled (back-
+# compat with all existing scenarios). Use ``--gps-bias METERS`` to
+# enable.
+GPS_MEAN_BIAS_M    = 0.0
 # Per-sample chance of a multi-metre discontinuity. Calibrated so the
 # expected outlier rate in seconds is ~0.005/s (one ~10 m jump per
 # 200 s, matching the real log) regardless of sample rate.
@@ -398,6 +461,25 @@ BOOTSTRAP_K_EMA_ALPHA = 0.2
 # the success ring. Floored variance keeps GPS pulling the filter
 # toward truth at a useful rate even after long convergence runs.
 EKF_POS_VAR_FLOOR = 1.0 ** 2                 # σ ≥ 1.0 m
+# Dropout-aware position covariance growth — ANISOTROPIC.
+# When GPS isn't producing an update on a given tick, dead-reckoning
+# error doesn't grow uniformly in all directions:
+#
+#   • Forward direction (along the body axis): wheel encoders
+#     measure forward distance directly. Forward uncertainty grows
+#     slowly during dropouts.
+#   • Lateral direction (perpendicular to motion): lateral error
+#     grows as distance · heading-uncertainty. Heading uncertainty
+#     itself accumulates, so lateral covariance can balloon quickly.
+#
+# Adding equal variance to P[0,0] and P[1,1] would produce a
+# circular ellipse, hiding this physical asymmetry. We instead
+# add to the rotated 2×2 covariance using the body's heading:
+#     ΔP = (σ_fwd² · f·f^T + σ_lat² · l·l^T) · dt
+# where f = (cos h, sin h), l = (-sin h, cos h), and h is the EKF's
+# belief of the body's world heading.
+EKF_DROPOUT_VAR_FWD_PER_S = 0.05             # m²/s along motion
+EKF_DROPOUT_VAR_LAT_PER_S = 1.2              # m²/s perpendicular
 
 # Heading-resync (Class-A "orbit" recovery). Once bootstrap finishes
 # the EKF's Kalman gain on θ shrinks to near zero, so a heading that
@@ -702,11 +784,21 @@ GPS_LEVER_ARM_CORRECTION_ENABLE = True   # robot-side flag
 # Catches small persistent biases (5-10°) that fall below the
 # moving-away (1 m / 3 s) and divergence (5 m) thresholds yet
 # still cause meters of cross-track error over a long goal.
-PERIODIC_REFIT_PERIOD_S        = 3.0
-PERIODIC_REFIT_THRESHOLD_DEG   = 10.0
+# The periodic refit's closed-form fit uses ODOM-displacement
+# angles to estimate θ — which contaminates the EKF's heading with
+# wheel-encoder drift the moment ODOM goes wrong. We replace it
+# with a GPS-CoG + IMU-yaw injection (see
+# ``_inject_gps_cog_theta_measurement``) that uses NO odom data:
+# the GPS readings have zero-mean noise centered on truth, and the
+# IMU/scan-match provides the body's instantaneous orientation in
+# the robot's own frame. Together they constrain θ without ever
+# touching encoder integration.
+PERIODIC_REFIT_PERIOD_S        = 0.5
+PERIODIC_REFIT_THRESHOLD_DEG   = 2.0
 PERIODIC_REFIT_MIN_BASELINE_M  = 2.0
-PERIODIC_REFIT_VAR_DEG         = 5.0
-PERIODIC_REFIT_ENABLE          = True
+PERIODIC_REFIT_VAR_DEG         = 3.0
+PERIODIC_REFIT_ENABLE          = False  # ← turned off; θ now from
+                                         # GPS-CoG + IMU only
 
 # Local-vs-world divergence detector (companion to moving-away).
 # Moving-away catches *radial* drift (raw GPS distance from the
@@ -723,6 +815,89 @@ LOCAL_VS_WORLD_DIVERGENCE_M         = 5.0
 LOCAL_VS_WORLD_MIN_LOCAL_PROGRESS_M = 5.0
 LOCAL_VS_WORLD_COOLDOWN_S           = 5.0
 LOCAL_VS_WORLD_DETECTOR_ENABLE      = True
+
+# ── 4-heading invariant watchdog (GPS Sim/DESIGN_INTENT.md) ────────
+# DESIGN_INTENT.md defines two θ estimators that must agree if the
+# algorithm has converged:
+#
+#   θ_motion = atan2(GPS Δ)        − atan2(odom Δ)            # (A − C)
+#   θ_goal   = atan2(goal − GPS)   − atan2(candidate − odom)  # (B − D)
+#
+# A persistent disagreement (|θ_motion − θ_goal| above threshold) is
+# evidence one frame is being rotated by something the other isn't —
+# GPS multipath, encoder yaw bias, spoofer pull, etc. The existing
+# position-progress divergence detector misses pure-heading drift.
+#
+# 1/r-envelope rationale (Nathan's thought experiment): when the
+# robot is close to the goal, |goal − GPS_now| shrinks toward the GPS
+# bias magnitude, so B's atan2 becomes noise-dominated. The watchdog
+# is therefore only trustworthy at distance — gate by
+# ``INV_ERROR_MIN_GOAL_DIST_M``. Far from the goal, the angular
+# effect of a constant GPS bias is negligible, and the disagreement
+# between the two θ estimators is the cleanest signal we have that
+# the algorithm is locking onto a contaminated heading.
+INV_ERROR_DETECTOR_ENABLE   = True
+INV_ERROR_THRESHOLD_DEG     = 12.0   # |θ_motion − θ_goal| above this
+                                      # for ≥ SUSTAINED_TICKS fires
+INV_ERROR_MIN_BASELINE_M    = 1.5    # need enough motion to fit A/C
+INV_ERROR_MIN_GOAL_DIST_M   = 3.0    # close-to-goal noise gate
+INV_ERROR_SUSTAINED_TICKS   = 30     # ~3 s @ SIM_DT=0.1 s
+INV_ERROR_ENV_SUSPEND_S     = 4.0    # 1/r envelope suspension on fire
+INV_ERROR_COOLDOWN_S        = 5.0    # rate-limit consecutive fires
+
+# ── GPS-vs-LOCAL magnitude ratio (DESIGN_INTENT.md, independent of EKF)
+# Foundational-assumption check for the direction-irrelevant
+# converging algorithm. The whole 4-heading scheme assumes the
+# transform between GPS world meters and LOCAL odom meters is a
+# PURE ROTATION R (no scale, no shear). Under that assumption,
+# magnitudes are R-invariant: ``|GPS Δ| ≡ |odom Δ|`` for the same
+# physical motion. So ``|GPS Δ| / |odom Δ| ≈ 1.0`` directly tests
+# whether R is in fact a rotation — i.e. whether the math under the
+# whole algorithm is even valid.
+#
+# Persistent deviation means the relationship isn't a rotation
+# anymore, which can be caused by:
+#   • Multipath stretching / compressing GPS Δ
+#   • Encoder wheel slip shrinking odom Δ
+#   • Spoofer pin pulling GPS toward a fake target (Δ_GPS uncoupled
+#     from real motion)
+#   • Lever-arm rotation during a turn (transient)
+#
+# Why this matters for survival without an EKF: if the EKF fails,
+# navigation breaks (no θ → no candidate goal in local frame). But
+# this check still fires — the precheck and runtime monitor can
+# refuse to greenlight the mission BEFORE the EKF failure causes a
+# 40-meter miss. It's the cheapest EKF-free health gate the system
+# has access to.
+INV_MAG_RATIO_DETECTOR_ENABLE = True
+INV_MAG_RATIO_LO            = 0.60   # |GPS Δ| / |odom Δ| below this
+INV_MAG_RATIO_HI            = 1.65   # or above this fires
+INV_MAG_RATIO_MIN_BASELINE_M = 1.0   # need real motion to compare
+INV_MAG_RATIO_SUSTAINED_TICKS = 30   # ~3 s sustained breach
+
+# ── Goal-distance magnitude invariant ────────────────────────────
+# The candidate-placement formula is built on a PURE ROTATION R
+# between virtual and world frames. Under that assumption, the
+# distance from the robot to the goal is R-invariant:
+#
+#   |goal_world − latest_gps|      (real-world dist to goal)
+#   |candidate_world − plan_anchor|(virtual-frame dist to candidate)
+#
+# must match. A persistent mismatch means the virtual robot has
+# **translated** away from the real robot (not just rotated) — and
+# no amount of θ correction can fix that. This is the failure mode
+# that EKF-off makes inevitable: virtual position drifts from real
+# via accumulated encoder yaw bias × distance, the candidate stays
+# correctly placed in the *virtual* frame, and the real robot ends
+# up offset from the goal by exactly the virtual↔real translation
+# error. This watchdog surfaces that translation error directly,
+# without needing access to truth.
+INV_GOAL_DIST_DETECTOR_ENABLE = True
+INV_GOAL_DIST_RATIO_LO      = 0.75   # virtual/gps ratio below this
+INV_GOAL_DIST_RATIO_HI      = 1.35   # or above this fires
+INV_GOAL_DIST_MIN_M         = 4.0    # ignore close-to-goal regime
+                                      # (noise dominates ratio there)
+INV_GOAL_DIST_SUSTAINED_TICKS = 30   # ~3 s sustained breach
 
 
 # ── Geographic ↔ local-tangent meters ────────────────────────────
@@ -1286,10 +1461,16 @@ class GPSEKF:
         c = math.cos(self.x[2]); s = math.sin(self.x[2])
         self.x[0] += c * dxo - s * dyo
         self.x[1] += s * dxo + c * dyo
-        # F = ∂f/∂x
+        # F = ∂f/∂x. The off-diagonal F[0,2]/F[1,2] entries let GPS
+        # position updates rotate θ via correlation — but they also
+        # let ODOM bias propagate into θ (when odom_delta is biased,
+        # the EKF "explains" the GPS-vs-predict discrepancy by
+        # rotating θ in the direction of the bias). Per user
+        # requirement: θ must completely ignore ODOM. Zeroed.
+        # θ is updated EXCLUSIVELY by direct
+        # ``update_theta_measurement`` calls, which use GPS course
+        # + IMU yaw (no odom angle anywhere).
         F = np.eye(3)
-        F[0, 2] = -s * dxo - c * dyo
-        F[1, 2] =  c * dxo - s * dyo
         self.P = F @ self.P @ F.T + self._Q * dt
         # Position-variance floor (real-robot parity, gps_ekf.py
         # GpsEkf.predict). When clamping a diagonal entry up, scale
@@ -1640,6 +1821,7 @@ class GPSWaypointSim:
                  odom_yaw_bias_rate=None,
                  goal_queue=None,
                  coldstart_bias_enabled=False,
+                 coldstart_theta_seed_variance_deg=45.0,
                  next_hint_enabled=None):
         self.cm = costmap
         self.start_world  = tuple(start_world)
@@ -1752,6 +1934,38 @@ class GPSWaypointSim:
         # integral). Both are 0 at construction.
         self.body_heading = 0.0          # rad, REPORTED, in odom frame
         self.body_heading_true = 0.0     # rad, TRUE physical orientation
+        # ── Parallel localizations for the 3-robot visualization ──
+        # ``self.odom`` is the navigation-used integration (clean when
+        # LIDAR_IMU_FUSION is on, biased when off). We additionally
+        # track two ALWAYS-ON parallel integrations so the GUI can
+        # show what each estimator believes regardless of which one
+        # is driving the controller:
+        #
+        #   odom_encoders_only — pure wheel-encoder integration. ALWAYS
+        #     has the encoder yaw bias (matches deployed /odom topic
+        #     when IMU fusion isn't running). Cyan diamond in the GUI.
+        #
+        #   odom_imu_fused — wheel-encoder + IMU yaw fusion. Matches
+        #     deployed /local_ekf/odom (the wheel+IMU fused output of
+        #     robot_localization, NOT the gps_handler EKF). Green dot.
+        #
+        # Both start at (0, 0) in odom-frame (= start_world in world
+        # frame) with the agent's true initial heading. They diverge
+        # from truth over time at different rates:
+        #   • encoders_only: drifts fast (K_eff = _odom_yaw_bias_rate)
+        #   • imu_fused: drifts slow (K_eff = IMU residual ≈ 0)
+        # Real-robot mental model: ODOM and EKF on the actual robot
+        # are BOTH integrations diverging from truth; the algorithm
+        # ensures the goal placement compensates regardless.
+        self.odom_encoders_only = [0.0, 0.0]
+        self.odom_imu_fused     = [0.0, 0.0]
+        self._yaw_bias_offset_encoders = 0.0
+        self._yaw_bias_offset_imu      = 0.0
+        # Body heading in each virtual robot's own frame. Updated
+        # every tick in ``step()`` and consumed by the GUI (triangle
+        # markers point in these directions, projected to world).
+        self.body_heading_encoders  = 0.0
+        self.body_heading_imu_fused = 0.0
         # Deterministic encoder yaw bias accumulator (rad). The
         # REPORTED body angle is derived as
         #   body_heading = body_heading_true + _yaw_bias_offset
@@ -1857,23 +2071,23 @@ class GPSWaypointSim:
         # cold-start θ_offset seed. Deployed handler only snaps the
         # EKF θ on the very FIRST GPS goal of the node's lifetime
         # (deployed L526); subsequent legs reuse the already-
-        # bootstrapped θ. Sim doesn't currently grow a θ seed of
-        # its own — this flag is here so any future seed path
-        # respects the first-leg-only contract by default.
+        # bootstrapped θ. One-shot guard, cleared never — even
+        # cancel-without-arrival leaves it set, matching the
+        # deployed contract that re-arming requires a process restart.
         self._coldstart_theta_seeded = False
         # CLI / kwarg toggle (matches deployed ROS parameter
-        # ``coldstart_bias_enabled``, default False, see
-        # gps_handler_node.py L481). Currently a wired stub: the
-        # sim has no equivalent of ``_seed_coldstart_theta_if_needed``
-        # because its EKF starts with theta_var0 = π² and the first
-        # GPS update already produces a near-unity Kalman gain on θ.
-        # TODO: if a real seed path is added (e.g. force-snap EKF θ
-        # to the goal bearing on the very first leg only), gate it
-        # on ``self._coldstart_bias_enabled`` and clear
-        # ``self._coldstart_theta_seeded`` on cancel-without-goal so
-        # the next valid leg picks up the snap. Field-parity contract
-        # only ever fires once per node lifetime.
+        # ``coldstart_bias_enabled``, default False; the deployed
+        # ``run-gps.sh`` flips it to True).
         self._coldstart_bias_enabled = bool(coldstart_bias_enabled)
+        # Seed variance for the one-shot θ snap. Matches deployed
+        # ``coldstart_theta_seed_variance_deg`` (default 45° in
+        # run-gps.sh on improve/gps-waypoint-continuity). Held in
+        # rad² to feed straight into ``EKF3.reset_theta``. The seed
+        # is deliberately loose so ``bootstrap_theta``'s first
+        # closed-form fit (fires once baseline > 1.5 m) dominates it.
+        self._coldstart_theta_seed_var_rad2 = (
+            math.radians(float(coldstart_theta_seed_variance_deg)) ** 2
+        )
         # Counter incremented every time ``_advance_to_next_leg``
         # actually promotes the shadow EWMA into the active
         # smoother (i.e. the cached hint matched the new leg within
@@ -1911,6 +2125,19 @@ class GPSWaypointSim:
         self._gps_bias_phase_y = rng.uniform(0, 2 * math.pi)
         self._gps_bias_dir_a   = rng.uniform(0, 2 * math.pi)  # ellipse axis
         self._gps_bias_eccen   = 0.6 + 0.3 * rng.random()     # 0.6–0.9
+        # Per-agent fixed mean bias (installation offset). One sample per
+        # agent at init, then applied to every GPS fix for the session.
+        # Magnitude uniform on [0, GPS_MEAN_BIAS_M]; direction uniform on
+        # [0, 2π). When GPS_MEAN_BIAS_M == 0 the offset is exactly zero
+        # so back-compat is bit-exact for existing scenarios.
+        if GPS_MEAN_BIAS_M > 0.0:
+            _bmag = rng.uniform(0.0, GPS_MEAN_BIAS_M)
+            _bdir = rng.uniform(0.0, 2.0 * math.pi)
+            self._gps_mean_bias_x = _bmag * math.cos(_bdir)
+            self._gps_mean_bias_y = _bmag * math.sin(_bdir)
+        else:
+            self._gps_mean_bias_x = 0.0
+            self._gps_mean_bias_y = 0.0
         self.gps_connected     = True
         self._random_dropout_active = False
         self._random_dropout_until  = -1.0                    # sim-time
@@ -1947,6 +2174,67 @@ class GPSWaypointSim:
         self._world_d_start = None
         self._divergence_cooldown_until = -1.0
         self._divergence_event_count = 0
+        # ── 4-heading invariant watchdog state ──
+        # Per ``GPS Sim/DESIGN_INTENT.md`` — continuously compare
+        # θ_motion (from displacement) against θ_goal (from candidate
+        # vs GPS goal). Persistent disagreement is the cleanest
+        # indicator that one of the two θ estimators is being rotated
+        # by a contamination the other isn't seeing.
+        self._inv_err_latest = float("nan")  # last computed (rad,
+                                              # signed). NaN until the
+                                              # first time the watchdog
+                                              # has enough state.
+        self._inv_err_max_abs = 0.0           # cumulative |err|_max,
+                                              # for diagnostics
+        self._inv_err_above_count = 0         # sustained-threshold
+                                              # tick counter
+        self._inv_err_cooldown_until = -1.0   # rate-limit consecutive
+                                              # fires
+        self._inv_err_fired_count = 0         # times the watchdog
+                                              # forced a resync
+        # ── EKF-independent magnitude-ratio invariant ──
+        # |GPS Δ| / |odom Δ| over the same window the heading
+        # watchdog uses. Works regardless of EKF state — even if the
+        # EKF is completely off, this metric still detects GPS-vs-
+        # LOCAL corruption from the displacement alone.
+        self._inv_ratio_latest = float("nan")
+        self._inv_ratio_min = float("inf")    # worst (low) excursion
+        self._inv_ratio_max = 0.0             # worst (high) excursion
+        self._inv_ratio_above_count = 0
+        self._inv_ratio_fired_count = 0
+        # Goal-distance magnitude invariant:
+        # |goal − latest_gps| (real-world dist to goal) vs
+        # |candidate − plan_anchor| (virtual-frame dist to candidate).
+        # A persistent mismatch surfaces translation between virtual
+        # and real (e.g., odom drift when EKF is off).
+        self._inv_goal_dist_latest_gps = float("nan")
+        self._inv_goal_dist_latest_virt = float("nan")
+        self._inv_goal_dist_ratio_latest = float("nan")
+        self._inv_goal_dist_above_count = 0
+        self._inv_goal_dist_fired_count = 0
+        # Worst-case body-heading-in-world error seen over the run.
+        # Tracked per-tick (not just at the end) so a transient
+        # large error during the orbit phase is visible in the GUI
+        # status panel even after the EKF recovers.
+        self._body_theta_err_max_abs_deg = 0.0
+        self._body_theta_err_latest_deg = 0.0
+        # GPS-anchored fallback: false at mission start (EKF assumed
+        # healthy), latches to True when degradation is detected
+        # (goal-distance invariant or consecutive EKF rejects). Once
+        # engaged, stays engaged for the rest of the mission so the
+        # candidate doesn't oscillate between anchor sources.
+        self._gps_fallback_engaged = False
+        self._gps_fallback_engaged_at_s = None
+        # ── EKF-death-surviving closed-form θ source ──
+        # When GPS_HEADING_EKF_ENABLE is False, the EKF state never
+        # updates (no Kalman θ-fusion), so we lose the canonical θ
+        # source the candidate projection needs. The deployed
+        # gps_handler still has gps_history and odom_history; the
+        # closed-form fit operates on those alone. We cache the
+        # latest fit here and the ``heading_offset_est`` property
+        # below substitutes it for ``ekf.theta`` when EKF is off.
+        # This is the "EKF-death-surviving" path of DESIGN_INTENT.
+        self._theta_no_ekf = 0.0
         # Cycle-slip state. While `_cycle_slip_until > sim_time`, every
         # GPS reading gets the persistent offset (_cycle_slip_dx,
         # _cycle_slip_dy) added on top of normal noise/bias.
@@ -2030,6 +2318,13 @@ class GPSWaypointSim:
         if first is None:
             first = (self.true_pos[0], self.true_pos[1])
         self.ekf = GPSEKF(first[0], first[1])
+        # improve/gps-waypoint-continuity — one-shot θ seed on the very
+        # first GPS goal (deployed gps_handler_node L2069). No-op
+        # unless ``coldstart_bias_enabled`` is True. Without this the
+        # first GPS sample's lever-arm residual / projector contamin-
+        # ation can lock the EKF onto the wrong heading offset before
+        # bootstrap has any displacement to fit against.
+        self._seed_coldstart_theta_if_needed(self.goal_world)
 
         # improve/gps-waypoint-continuity — seed the next-hint cache
         # from the head of ``goal_queue`` so the shadow EWMA can
@@ -2198,6 +2493,13 @@ class GPSWaypointSim:
         (noisy) reading or None if no fix this cycle (random dropout
         OR robot under a roof). In --crazy mode roofs may occasionally
         leak a heavily-skewed reflected fix instead of dropping out."""
+        # ── Launch-stack toggle: GPS receiver down ──
+        # Models the /gps_fix publisher never coming up. The agent
+        # runs on dead-reckoning only — EKF gets no updates and the
+        # heading-offset estimate stays stuck at its prior.
+        if not GPS_RECEIVER_ENABLE:
+            self.gps_connected = False
+            return None
         # Random dropout state machine
         if (self._random_dropout_active
                 and self.sim_time >= self._random_dropout_until):
@@ -2282,8 +2584,11 @@ class GPSWaypointSim:
         if spoof is not None:
             base_x, base_y = spoof
         else:
-            base_x = ant_x + dx + px
-            base_y = ant_y + dy + py
+            # Per-agent fixed mean bias: persistent installation-offset
+            # error this receiver carries for its entire session. NOT
+            # applied to spoofed fixes — the spoofer overrides everything.
+            base_x = ant_x + dx + px + self._gps_mean_bias_x
+            base_y = ant_y + dy + py + self._gps_mean_bias_y
         nx = base_x + self.rng.normal(0, sigma)
         ny = base_y + self.rng.normal(0, sigma)
         # One-shot multipath spike
@@ -2487,6 +2792,17 @@ class GPSWaypointSim:
         return self._joint_theta_K_fit(samples, min_baseline)
 
     def _maybe_resync_heading(self):
+        """Disabled: the closed-form fit uses ODOM displacement angle
+        as its body-direction reference, which means ODOM bias
+        propagates directly into the EKF's θ. Per the user's
+        directive ("EKF heading must completely ignore ODOM"), every
+        injection that uses ``_closed_form_theta_window`` or
+        ``_bootstrap_theta`` has been turned off. θ now updates ONLY
+        through ``_inject_gps_cog_theta_measurement`` which uses
+        GPS course-over-ground + IMU yaw (no odom angle anywhere)."""
+        return
+        # Original implementation kept below for reference; remove
+        # the early return above to re-enable.
         """Continuously check the EKF's θ against the closed-form
         GPS-vs-odom fit over a recent window. If they disagree
         significantly, snap θ to the closed-form value and re-widen
@@ -2542,6 +2858,12 @@ class GPSWaypointSim:
         self.K_est = (1.0 - a) * self.K_est + a * float(K_fit)
 
     def _force_heading_resync(self):
+        """Disabled: same reasoning as ``_maybe_resync_heading`` —
+        this path uses ``_closed_form_theta_window`` whose result is
+        contaminated by ODOM-displacement angle. θ now updates
+        only through ``_inject_gps_cog_theta_measurement``."""
+        return
+        # Original below; remove the early return to re-enable.
         """Aggressive heading-resync, called from the moving-away
         branch of `_update_stuck_detector`. Uses a wider window than
         the cooldown-gated standard one (so limit-cycling agents
@@ -2575,6 +2897,64 @@ class GPSWaypointSim:
         # (don't extend its cooldown — we want fast convergence).
         self._heading_resync_count += 1
         return True
+
+    def _inject_gps_cog_theta_measurement(self):
+        """Continuous GPS-course-over-ground θ measurement injected
+        into the EKF. This is the "GPS-as-truth for position +
+        scan-matching/IMU-as-truth for orientation" approach the
+        deployed robot wants:
+
+            θ = (world heading the body is travelling along)
+                − (body heading in odom = IMU-fused yaw)
+
+        Because both terms are sourced from "truth-grade" sensors
+        (GPS for the world direction of motion, IMU for the body's
+        own pointing direction in odom), this θ measurement does
+        NOT depend on the wheel-encoder odometry that drifts by
+        design. The EKF state is pulled to this value on every
+        tick the body is moving forward enough that the GPS course
+        is meaningful.
+
+        Distinct from ``_periodic_heading_refit``: that one fits
+        θ from GPS-displacement *and* odom-displacement, which
+        leaks encoder noise into the answer. THIS one uses only
+        the GPS direction of motion + IMU body orientation.
+        """
+        if not GPS_HEADING_EKF_ENABLE or self.ekf is None:
+            return
+        # Fire even pre-bootstrap — the GPS-CoG measurement is the
+        # only θ source the EKF has now, so we want it injecting from
+        # the very first usable GPS samples.
+        if len(self.gps_history) < 8:
+            return
+        # Forward motion only — reversing the body breaks the
+        # "GPS course = body forward" assumption.
+        if self.forward_vel < 0.3:
+            return
+        # Use a ~3 s window (assumes 10 Hz GPS); fewer samples make
+        # the course estimate noisy, more samples lag truth.
+        n = min(30, len(self.gps_history))
+        old_gps = self.gps_history[-n][1]
+        new_gps = self.gps_history[-1][1]
+        dx = new_gps[0] - old_gps[0]
+        dy = new_gps[1] - old_gps[1]
+        baseline = math.hypot(dx, dy)
+        # Need real motion — short baselines are GPS noise.
+        if baseline < 1.5:
+            return
+        cog_gps = math.atan2(dy, dx)
+        theta_obs = ((cog_gps - self.body_heading_imu_fused + math.pi)
+                      % (2 * math.pi) - math.pi)
+        # Tight measurement σ — this is now the EKF's PRIMARY θ
+        # source (the closed-form refit is disabled, and the
+        # F-Jacobian's θ↔position cross-terms are zeroed). The
+        # noise IS larger than this number — single-sample σ at
+        # baseline=1.5m is ~46° — but the EKF averages N independent
+        # samples and a tight σ lets each one pull θ a meaningful
+        # fraction toward CoG. Empirically a wide σ here lets θ
+        # coast; a tight σ keeps it pinned.
+        sigma_rad = math.radians(2.0)
+        self.ekf.update_theta_measurement(theta_obs, sigma_rad)
 
     def _periodic_heading_refit(self):
         """Real-robot parity, mirrored from
@@ -2651,7 +3031,9 @@ class GPSWaypointSim:
         if gps is None:
             return
         gx, gy = self.goal_world
-        ex, ey = self.ekf.pos_xy
+        # When EKF is off, this divergence detector reads the live
+        # position from the same source the planner uses (raw GPS).
+        ex, ey = self._plan_anchor_xy()
         local_d = math.hypot(gx - ex, gy - ey)
         world_d = math.hypot(gps[0] - gx, gps[1] - gy)
 
@@ -2685,6 +3067,476 @@ class GPSWaypointSim:
             self._local_d_start = local_d
             self._world_d_start = world_d
 
+    # ── Arrival validators (DESIGN_INTENT.md) ─────────────────────
+    # Per design intent: at distances close to the goal, the
+    # algorithm's authoritative reference is the LOCAL-frame
+    # candidate (because angular bias-induced θ_err = atan(bias /
+    # distance) blows up as adjacent shrinks). The sim follows that
+    # contract by combining three independent checks for arrival,
+    # ALL of which must pass:
+    #
+    #   1. ``arrival_local_d``  — odom-frame proximity to the
+    #                              smoothed candidate
+    #   2. ``arrival_gps_d``    — GPS-frame proximity to the
+    #                              absolute goal (deployed gate)
+    #   3. ``arrival_mahalan``  — EKF's belief of being at the goal,
+    #                              weighted by covariance. Chi-squared
+    #                              statistic; < CHI2_2DOF_95 ≈ 5.99
+    #                              means the goal is inside the 95%
+    #                              confidence ellipse of the EKF
+    #                              position estimate.
+    #
+    # The Mahalanobis gate is the new piece. Without it, a GPS bias
+    # can shift the GPS-frame reading enough to declare arrival
+    # while the EKF's own belief says "I have no idea where I am."
+    # That's the failure mode the deployed precheck doesn't catch.
+    _ARRIVAL_MAHALAN_CHI2 = 5.99  # χ² 2-DOF at p=0.95
+
+    def _compute_arrival_mahalanobis(self):
+        """Mahalanobis distance² of the absolute GPS goal from the
+        EKF's position posterior. Lower = goal is well inside the
+        EKF's confidence ellipse. Returns ``float('inf')`` when the
+        position covariance is degenerate (shouldn't happen post-
+        bootstrap but safe to guard).
+
+        EKF-death-surviving caveat: when ``GPS_HEADING_EKF_ENABLE``
+        is False, the EKF state never updates from GPS, so both
+        ``ekf.x`` (position) AND ``ekf.P`` (covariance) stay at
+        init values. The χ² computation would compare the goal
+        against a stale anchor with a stale covariance — both
+        meaningless. Return NaN so the arrival gate falls back to
+        the local + GPS distance checks alone (which are the only
+        meaningful arrival signals available when the EKF isn't
+        fusing). The χ² gate is a refinement that requires the EKF
+        to be working; it's not a hard requirement for arrival.
+        """
+        if self.ekf is None or self.goal_world is None:
+            return float("inf")
+        if not GPS_HEADING_EKF_ENABLE:
+            return float("nan")
+        dx = float(self.goal_world[0] - self.ekf.x[0])
+        dy = float(self.goal_world[1] - self.ekf.x[1])
+        P = self.ekf.P
+        a = float(P[0, 0]); b = float(P[0, 1])
+        c = float(P[1, 0]); d = float(P[1, 1])
+        det = a * d - b * c
+        if det < 1e-12:
+            return float("inf")
+        # P_inv = (1/det) * [[d, -b], [-c, a]]
+        inv_a, inv_b = d / det, -b / det
+        inv_c, inv_d = -c / det, a / det
+        return float(dx * (inv_a * dx + inv_b * dy)
+                     + dy * (inv_c * dx + inv_d * dy))
+
+    def _arrival_validators(self):
+        """Returns a dict of the three arrival signals for inspection
+        and gating. ``all_valid`` is the conjunction the deployed
+        arrival-declare logic should use."""
+        # Local-frame proximity (odom → candidate).
+        if self._smoothed_candidate is None:
+            local_d = float("inf")
+        else:
+            local_d = math.hypot(
+                self._smoothed_candidate[0] - self.odom[0],
+                self._smoothed_candidate[1] - self.odom[1])
+        # GPS-frame proximity (last fix → goal) — same metric the
+        # deployed stage-2 check already uses.
+        if self.gps_history and self.goal_world is not None:
+            gx, gy = self.gps_history[-1][1]
+            gps_d = math.hypot(gx - self.goal_world[0],
+                               gy - self.goal_world[1])
+        else:
+            gps_d = float("inf")
+        mahalan = self._compute_arrival_mahalanobis()
+        # χ² gate is skipped when EKF off — mahalan returns NaN in
+        # that case, and a NaN comparison would always be False,
+        # blocking arrival forever. Local + GPS distance alone is
+        # the EKF-death-surviving arrival criterion.
+        chi2_ok = (mahalan != mahalan  # NaN sentinel
+                   or mahalan < self._ARRIVAL_MAHALAN_CHI2)
+        all_valid = (local_d < GOAL_RADIUS
+                     and gps_d < GOAL_RADIUS
+                     and chi2_ok)
+        return {
+            "local_d": local_d,
+            "gps_d": gps_d,
+            "mahalan": mahalan,
+            "all_valid": all_valid,
+        }
+
+    # ── 4-heading invariant watchdog ─────────────────────────────────
+    def _compute_four_heading_error(self):
+        """Compute the 4-heading invariant from
+        ``GPS Sim/DESIGN_INTENT.md``.
+
+        Returns ``(err_rad, baseline_m, goal_dist_m)``. Any
+        precondition failure returns ``(None, 0.0, 0.0)``.
+
+        Headings:
+            A = atan2(GPS Δ from oldest history entry to latest)
+            B = atan2(goal_world − GPS_now)
+            C = atan2(odom Δ over the same baseline as A)
+            D = atan2(candidate − odom_now)   [both in odom frame]
+
+        Invariant: θ_motion = A − C should equal θ_goal = B − D
+        modulo 2π. The returned ``err_rad`` is wrap_pi of the
+        difference; magnitude is the disagreement.
+
+        Preconditions:
+          * ≥ 4 GPS samples in history
+          * goal_world and smoothed candidate both set
+          * GPS-Δ AND odom-Δ baselines both ≥ INV_ERROR_MIN_BASELINE_M
+          * |goal_world − GPS_now| ≥ INV_ERROR_MIN_GOAL_DIST_M
+            (close-to-goal geometry gate: tan(θ_err) = bias/distance
+            ⇒ B becomes noise-dominated as distance shrinks toward
+            the bias magnitude. Disabling the watchdog at close range
+            mirrors why the 1/r envelope filter exists)
+          * |candidate − odom_now| ≥ 0.05 m (D must be defined)
+        """
+        if len(self.gps_history) < 4:
+            return None, 0.0, 0.0
+        if self.goal_world is None or self._smoothed_candidate is None:
+            return None, 0.0, 0.0
+        if self.last_gps_xy is None:
+            return None, 0.0, 0.0
+
+        # Use the widest baseline available: oldest history entry vs
+        # the most recent. Mirrors the closed-form fit's anchor
+        # choice (oldest sample) so the two estimators see the same
+        # window when the watchdog and closed-form-resync co-fire.
+        old = self.gps_history[0]
+        cur = self.gps_history[-1]
+        gx_old, gy_old = old[1]
+        gx_new, gy_new = cur[1]
+        ox_old, oy_old = old[2]
+        ox_new, oy_new = cur[2]
+
+        gps_dx = gx_new - gx_old
+        gps_dy = gy_new - gy_old
+        odom_dx = ox_new - ox_old
+        odom_dy = oy_new - oy_old
+
+        gps_baseline = math.hypot(gps_dx, gps_dy)
+        odom_baseline = math.hypot(odom_dx, odom_dy)
+        if (gps_baseline < INV_ERROR_MIN_BASELINE_M
+                or odom_baseline < INV_ERROR_MIN_BASELINE_M):
+            return None, min(gps_baseline, odom_baseline), 0.0
+
+        gpx, gpy = self.last_gps_xy
+        goal_dx = self.goal_world[0] - gpx
+        goal_dy = self.goal_world[1] - gpy
+        goal_dist = math.hypot(goal_dx, goal_dy)
+        if goal_dist < INV_ERROR_MIN_GOAL_DIST_M:
+            # Watchdog disabled in the bias-vs-distance regime where
+            # atan(bias / adjacent) is no longer small.
+            #
+            # The deliberate handoff per DESIGN_INTENT: once we are
+            # close to the goal, the ENU projected candidate in the
+            # robot's LOCAL frame is the authoritative answer. θ has
+            # already converged via far-field watchdog + closed-form
+            # fits, the candidate's odom-frame position was set with
+            # that converged θ, and by arrival time the local-frame
+            # candidate equals the absolute GPS goal. Suppressing
+            # the watchdog here prevents close-range B-noise from
+            # un-converging θ at the worst possible moment.
+            return None, min(gps_baseline, odom_baseline), goal_dist
+
+        cand_dx = self._smoothed_candidate[0] - self.odom[0]
+        cand_dy = self._smoothed_candidate[1] - self.odom[1]
+        if math.hypot(cand_dx, cand_dy) < 0.05:
+            return None, min(gps_baseline, odom_baseline), goal_dist
+
+        A = math.atan2(gps_dy, gps_dx)
+        C = math.atan2(odom_dy, odom_dx)
+        B = math.atan2(goal_dy, goal_dx)
+        D = math.atan2(cand_dy, cand_dx)
+
+        theta_motion = A - C
+        theta_goal = B - D
+        err = ((theta_motion - theta_goal + math.pi)
+               % (2.0 * math.pi)) - math.pi
+        return err, min(gps_baseline, odom_baseline), goal_dist
+
+    def _update_theta_no_ekf(self):
+        """EKF-death-surviving θ source. Run every tick when
+        ``GPS_HEADING_EKF_ENABLE`` is False so the candidate-goal
+        projection has a fresh θ to project with.
+
+        Inputs: ``self.gps_history`` and ``self.odom_history``
+        (already captured by ``_tick_gps``). No Kalman state used.
+        Output: ``self._theta_no_ekf`` — the same θ the EKF resync
+        paths would have written into ``ekf.theta``, just read back
+        directly.
+
+        Cold-start seed: until enough baseline accumulates for the
+        closed-form fit to lock, we keep whatever
+        ``_seed_coldstart_theta_if_needed`` deposited at goal
+        acceptance (which writes both ekf.x[2] AND, on the EKF-off
+        path, _theta_no_ekf — see the cold-start method's hook).
+        """
+        if GPS_HEADING_EKF_ENABLE:
+            return  # EKF is the authoritative source; nothing to do
+        theta, _K, baseline = self._closed_form_theta_window(
+            HEADING_RESYNC_WINDOW,
+            min_baseline=HEADING_RESYNC_MIN_BASELINE_M)
+        if theta is None:
+            return  # not enough motion yet; keep the existing value
+        # Direct adoption — there's no Kalman uncertainty to weigh
+        # against, so we just track the latest fit.
+        self._theta_no_ekf = float(theta)
+
+    def _compute_baseline_magnitude_ratio(self):
+        """|GPS Δ| / |odom Δ| over the oldest→latest window. Returns
+        ``None`` if there isn't enough history or motion to evaluate.
+
+        Independent of the EKF: this is purely a magnitude check on
+        the displacement vectors. The rotation between frames (θ)
+        doesn't affect the magnitudes — same physical motion, two
+        coordinate descriptions. A persistent ratio ≠ 1 is direct
+        evidence one frame has been corrupted in magnitude
+        (multipath stretching GPS, encoder slip shrinking odom, etc.)
+        — even if θ itself is completely wrong.
+
+        Survives EKF-off: even when the EKF never updates, this
+        signal will fire on real-world corruption, so the runtime
+        monitor / mission_precheck can refuse to greenlight a
+        compromised mission long before navigation breaks.
+        """
+        if len(self.gps_history) < 4:
+            return None
+        old = self.gps_history[0]
+        cur = self.gps_history[-1]
+        gps_d = math.hypot(cur[1][0] - old[1][0], cur[1][1] - old[1][1])
+        odom_d = math.hypot(cur[2][0] - old[2][0], cur[2][1] - old[2][1])
+        if odom_d < INV_MAG_RATIO_MIN_BASELINE_M:
+            return None
+        return gps_d / odom_d
+
+    def _update_magnitude_ratio_watchdog(self):
+        """Companion to ``_update_invariant_watchdog`` — checks the
+        translation-magnitude invariant rather than the rotation
+        invariant. The two together cover both DOFs of the rigid
+        2-D transform between frames."""
+        if not INV_MAG_RATIO_DETECTOR_ENABLE:
+            return
+        ratio = self._compute_baseline_magnitude_ratio()
+        if ratio is None:
+            return
+        self._inv_ratio_latest = ratio
+        if ratio < self._inv_ratio_min:
+            self._inv_ratio_min = ratio
+        if ratio > self._inv_ratio_max:
+            self._inv_ratio_max = ratio
+        if ratio < INV_MAG_RATIO_LO or ratio > INV_MAG_RATIO_HI:
+            self._inv_ratio_above_count += 1
+            if self._inv_ratio_above_count >= INV_MAG_RATIO_SUSTAINED_TICKS:
+                # Same mitigation as the heading watchdog: suspend
+                # the 1/r envelope so the candidate can move freely
+                # while one or both frames are demonstrably wrong.
+                # Don't force a heading resync here — the rotation
+                # may be fine; it's the magnitude that's broken.
+                # Suspending the envelope is enough to let the
+                # smoother re-converge once the corruption clears.
+                self._envelope_suspended_until_s = (
+                    self.sim_time + INV_ERROR_ENV_SUSPEND_S)
+                self._inv_ratio_fired_count += 1
+                self._inv_ratio_above_count = 0
+        else:
+            self._inv_ratio_above_count = 0
+
+    def _compute_goal_distance_magnitudes(self):
+        """Returns ``(gps_dist_to_goal, virt_dist_to_candidate)`` for
+        the goal-distance magnitude invariant. Either value is
+        ``None`` when it can't be computed this tick (no GPS yet,
+        no candidate yet, no goal).
+
+        gps_dist  = ‖goal_world − latest_gps‖ — the real-world
+                    distance from the real robot to the real GPS
+                    goal. Independent of EKF state.
+
+        virt_dist = ‖candidate_world − plan_anchor‖ — the virtual-
+                    frame distance from the virtual robot (EKF or
+                    odom, depending on enable flags) to the candidate
+                    goal. This is the distance the planner / NAV2
+                    actually drives to zero.
+
+        Under the algorithm's R-rotation assumption these magnitudes
+        are equal (rotation is isometric). A persistent inequality
+        means virtual has translated from real — the rotation hack
+        can't recover.
+        """
+        if self.goal_world is None:
+            return None, None
+        gps = self.latest_gps()
+        if gps is not None:
+            gps_d = math.hypot(self.goal_world[0] - gps[0],
+                               self.goal_world[1] - gps[1])
+        else:
+            gps_d = None
+        cand = self.intermediate_goal_world()
+        if cand is not None:
+            ex, ey = self._plan_anchor_xy()
+            virt_d = math.hypot(cand[0] - ex, cand[1] - ey)
+        else:
+            virt_d = None
+        return gps_d, virt_d
+
+    def _update_goal_distance_watchdog(self):
+        """Translation-of-virtual-robot detector. Fires when
+        ‖goal − latest_gps‖ disagrees with ‖candidate − plan_anchor‖
+        by more than the configured ratio band, sustained across
+        ``INV_GOAL_DIST_SUSTAINED_TICKS`` consecutive ticks.
+
+        Why this matters: with EKF off (or with a global EKF that
+        isn't fusing GPS), the virtual robot's position drifts from
+        the real robot's position via accumulated encoder yaw bias.
+        The candidate stays correctly placed in the virtual frame,
+        so the planner believes it's on course — but the real robot
+        is offset by the virtual↔real translation. The 4-heading
+        invariant only checks rotation; THIS check covers the
+        translation half of the rigid transform.
+        """
+        if not INV_GOAL_DIST_DETECTOR_ENABLE:
+            return
+        gps_d, virt_d = self._compute_goal_distance_magnitudes()
+        if gps_d is None or virt_d is None:
+            return
+        self._inv_goal_dist_latest_gps = gps_d
+        self._inv_goal_dist_latest_virt = virt_d
+        # Gate on minimum goal distance — when the robot is within a
+        # few meters of the goal the ratio is dominated by GPS noise
+        # and stops being a meaningful signal.
+        if gps_d < INV_GOAL_DIST_MIN_M and virt_d < INV_GOAL_DIST_MIN_M:
+            self._inv_goal_dist_above_count = 0
+            return
+        denom = max(gps_d, 1e-6)
+        ratio = virt_d / denom
+        self._inv_goal_dist_ratio_latest = ratio
+        if (ratio < INV_GOAL_DIST_RATIO_LO
+                or ratio > INV_GOAL_DIST_RATIO_HI):
+            self._inv_goal_dist_above_count += 1
+            if (self._inv_goal_dist_above_count
+                    >= INV_GOAL_DIST_SUSTAINED_TICKS):
+                # No automatic mitigation: this watchdog reports a
+                # condition that no rotation-based correction can
+                # fix. The action belongs upstream — either enable
+                # GPS fusion in the EKF, or abort the mission. We
+                # bump a counter and suspend the candidate envelope
+                # briefly so the smoother can react to any concurrent
+                # heading watchdog without being blocked by stale
+                # candidates.
+                self._envelope_suspended_until_s = (
+                    self.sim_time + INV_ERROR_ENV_SUSPEND_S)
+                self._inv_goal_dist_fired_count += 1
+                self._inv_goal_dist_above_count = 0
+        else:
+            self._inv_goal_dist_above_count = 0
+
+    def _update_gps_fallback_engagement(self):
+        """Latch ``_gps_fallback_engaged`` on detected EKF degradation.
+
+        Once engaged, ``_plan_anchor_xy()`` switches from
+        ``ekf.pos_xy`` to ``latest_gps()``. The candidate-placement
+        formula becomes:
+
+            candidate_odom = self.odom
+                             + R(-θ_closed_form) · (goal − GPS)
+
+        which is recomputed every tick. As the real robot moves and
+        accumulates encoder yaw bias, the next GPS read updates
+        ``latest_gps`` to the real position, the candidate moves to
+        keep pointing at the world goal, and the robot's NAV2
+        controller corrects via the new local-frame target. The
+        trajectory is a curve (bias bends it; GPS feedback un-bends
+        it) but converges as long as GPS is reliable.
+
+        Engagement is **one-way for the rest of the mission** so the
+        candidate doesn't ping-pong between EKF and GPS anchors. The
+        EKF may recover, but we don't re-engage it — once the algorithm
+        has lost confidence, it stays in the safer mode.
+
+        Triggers (any of):
+          1. ``INV_GOAL_DIST`` watchdog has fired at least
+             ``GPS_FALLBACK_TRIGGER_GOAL_DIST_FIRES`` time(s) —
+             virtual robot has translated from real, the candidate
+             placement is no longer self-consistent.
+          2. EKF has rejected ``GPS_FALLBACK_TRIGGER_EKF_REJECTS``
+             consecutive GPS updates — the EKF has stopped tracking
+             truth (lock-in recovery is about to fire anyway, but
+             we don't trust the post-recovery pose either).
+
+        Disabling the feature via ``GPS_FALLBACK_ENABLE = False``
+        leaves the algorithm without a fallback — degraded EKF =
+        guaranteed miss.
+        """
+        if not GPS_FALLBACK_ENABLE:
+            return
+        if self._gps_fallback_engaged:
+            return
+        # The fallback is a last-resort recovery for when the
+        # *planner's chosen anchor* (the EKF virtual robot) has gone
+        # unreliable. When the operator has DELIBERATELY pointed the
+        # planner at the ODOM virtual robot (``GPS_HEADING_EKF_ENABLE``
+        # = False), don't auto-engage — overriding that choice would
+        # silently mask the failure mode the user is trying to
+        # observe. The triggers only fire while the EKF is the
+        # active anchor.
+        if not GPS_HEADING_EKF_ENABLE:
+            return
+        # Trigger 1: goal-distance invariant has fired
+        if (self._inv_goal_dist_fired_count
+                >= GPS_FALLBACK_TRIGGER_GOAL_DIST_FIRES):
+            self._gps_fallback_engaged = True
+            self._gps_fallback_engaged_at_s = self.sim_time
+            return
+        # Trigger 2: EKF consecutive-reject streak (use the EKF's
+        # own counter — incremented by ``ekf.update`` on gating
+        # failure, reset on success).
+        if (self.ekf is not None
+                and self.ekf.consecutive_rejects
+                    >= GPS_FALLBACK_TRIGGER_EKF_REJECTS):
+            self._gps_fallback_engaged = True
+            self._gps_fallback_engaged_at_s = self.sim_time
+            return
+
+    def _update_invariant_watchdog(self):
+        """Run the 4-heading invariant on this tick. When the
+        disagreement holds above threshold for SUSTAINED_TICKS
+        consecutive ticks, force a heading resync and suspend the
+        1/r envelope — same mitigation the moving-away / local-vs-
+        world detectors already use.
+
+        Per design intent: the candidate has converged to the true
+        goal iff both θ-estimators agree. The watchdog is the
+        cleanest sim-observable proxy for the algorithm's own
+        statement of self-consistency.
+        """
+        if not INV_ERROR_DETECTOR_ENABLE:
+            return
+        err, baseline, goal_dist = self._compute_four_heading_error()
+        if err is None:
+            return
+        self._inv_err_latest = err
+        abs_err = abs(err)
+        if abs_err > self._inv_err_max_abs:
+            self._inv_err_max_abs = abs_err
+        if self.sim_time < self._inv_err_cooldown_until:
+            # Cooldown in effect — keep recording the latest value
+            # for visibility but don't re-fire.
+            return
+        if abs_err > math.radians(INV_ERROR_THRESHOLD_DEG):
+            self._inv_err_above_count += 1
+            if self._inv_err_above_count >= INV_ERROR_SUSTAINED_TICKS:
+                self._envelope_suspended_until_s = (
+                    self.sim_time + INV_ERROR_ENV_SUSPEND_S)
+                self._force_heading_resync()
+                self._inv_err_cooldown_until = (
+                    self.sim_time + INV_ERROR_COOLDOWN_S)
+                self._inv_err_fired_count += 1
+                self._inv_err_above_count = 0
+        else:
+            self._inv_err_above_count = 0
+
     # -- Goal projections / display helpers ------------------------------
     def latest_gps(self):
         # gps_history entry shape is (stamp_s, gps_xy, odom_xy);
@@ -2694,7 +3546,84 @@ class GPSWaypointSim:
 
     @property
     def heading_offset_est(self):
-        return self.ekf.theta if self.ekf is not None else 0.0
+        # New robust algorithm — EKF-survival fallback (DESIGN_INTENT):
+        # the 4-heading invariant works with EITHER the EKF as the
+        # local-frame source (the D-angle comes from candidate-vs-
+        # EKF) OR with pure ODOM as the source (D comes from
+        # candidate-vs-odom_in_map). When the EKF is down, swap to
+        # the ODOM-derived path: a closed-form θ fit from
+        # gps_history + odom_history (no Kalman state needed).
+        # ``_update_theta_no_ekf`` caches the latest fit each tick.
+        #
+        # This is intentional competition robustness — if EKF dies
+        # mid-mission, the algorithm degrades to a still-functional
+        # estimator rather than collapsing.
+        if self.ekf is None:
+            return 0.0
+        if not GPS_HEADING_EKF_ENABLE:
+            return self._theta_no_ekf
+        return self.ekf.theta
+
+    def _plan_anchor_xy(self):
+        """Position source the planner / controller uses to project
+        the candidate goal. This is the **virtual robot's belief of
+        where it is** — the planner only knows about the virtual
+        robot, not the real one, so the candidate is anchored here
+        and forces commanded relative to it are applied to the REAL
+        robot's physics.
+
+        Three localizations are visualized in the GUI:
+
+          * **True robot** (red)          — sim ground truth
+          * **EKF-believed robot** (green) — what ``ekf.pos_xy`` says
+          * **ODOM-believed robot** (cyan) — what pure ODOM would
+              say (``self.odom``)
+
+        Planning anchor:
+          * EKF up   → ``self.ekf.pos_xy`` (GPS-fused; tracks real
+                          position closely as long as the EKF runs)
+          * EKF off  → ``self.odom``       (raw biased odom — the
+                          ONLY localization the real robot has when
+                          GPS isn't fused into the EKF, and the one
+                          its NAV2 / controller would actually drive
+                          against on the deployed stack)
+
+        Why ``self.odom`` and **not** ``latest_gps()`` when EKF is
+        off: ``latest_gps()`` is ≈ real position. Using it as the
+        planning anchor would make the controller drive "from real
+        position to candidate," and the real robot would reach the
+        goal — masking the fundamental failure mode this branch is
+        designed to surface. The deployed robot has no such anchor:
+        without GPS in the EKF, the controller knows only odom, and
+        the real robot drifts from the planned trajectory by exactly
+        the accumulated encoder-yaw bias × distance.
+
+        Implication: this simulator does **not** model an algorithm
+        that "survives EKF being off." It models the real failure
+        and shows why the proper fix is to fuse GPS into the EKF
+        on the deployed robot (global EKF / navsat_transform style),
+        so virtual ≈ real and candidate-on-GPS-goal actually commands
+        the real robot to the goal.
+        """
+        # Planner anchor: STRICTLY one of the two virtual robots.
+        # No third source — the A* path always emanates from either
+        # the green EKF robot or the blue ODOM robot, never from a
+        # raw GPS reading or any other intermediate. The toggle is
+        # the sole control:
+        #   • EKF on  → anchor on EKF virtual robot (green)
+        #   • EKF off → anchor on ODOM virtual robot (blue)
+        # (The GPS-fallback watchdog, if it ever engages, signals
+        # degradation but does NOT change the anchor.)
+        if self.ekf is not None and GPS_HEADING_EKF_ENABLE:
+            return self.ekf.pos_xy
+        # ODOM virtual robot's world position — matches the blue
+        # circle's center in the GUI exactly.
+        c_h = math.cos(self.true_heading)
+        s_h = math.sin(self.true_heading)
+        sx, sy = self.start_world
+        ox, oy = self.odom_encoders_only
+        return (sx + c_h * ox - s_h * oy,
+                sy + s_h * ox + c_h * oy)
 
     @property
     def body_heading_world(self):
@@ -2853,15 +3782,10 @@ class GPSWaypointSim:
           in the visualization the candidate ends up overlapping
           the red robot dot — exactly like the field GUI showed.
         """
-        if not GPS_HEADING_EKF_ENABLE:
-            c = math.cos(self.true_heading)
-            s = math.sin(self.true_heading)
-            gx, gy = self.goal_world
-            return (c * gx - s * gy, s * gx + c * gy)
-        if self.ekf is None:
-            ex, ey = self.latest_gps()
-        else:
-            ex, ey = self.ekf.pos_xy
+        # Use the same plan_anchor source as the planner — that's
+        # the position the candidate gets projected from. EKF when
+        # up, ODOM (= self.odom) when down.
+        ex, ey = self._plan_anchor_xy()
         vx = self.goal_world[0] - ex
         vy = self.goal_world[1] - ey
         dtheta = self.true_heading - self.heading_offset_est
@@ -2890,14 +3814,14 @@ class GPSWaypointSim:
         but algorithmic improvements that affect the published goal
         should be developed against this method first.
         """
-        if self.ekf is None:
-            ex, ey = (0.0, 0.0)
-        else:
-            ex, ey = self.ekf.pos_xy
+        # Position source = whatever the planner uses (EKF when up,
+        # ODOM when down). Same _plan_anchor_xy() helper for
+        # consistency.
+        ex, ey = self._plan_anchor_xy()
         gx_w, gy_w = self.goal_world
         dx_w = gx_w - ex
         dy_w = gy_w - ey
-        theta = self.heading_offset_est  # = ekf.theta or 0 if no EKF
+        theta = self.heading_offset_est  # closed-form θ when EKF off
         c = math.cos(-theta); s = math.sin(-theta)
         dx_o = c * dx_w - s * dy_w
         dy_o = s * dx_w + c * dy_w
@@ -2938,16 +3862,94 @@ class GPSWaypointSim:
         ox, oy = self.odom[0], self.odom[1]
         dox = sx_o - ox
         doy = sy_o - oy
-        if self.ekf is not None:
-            theta = self.heading_offset_est  # = ekf.theta
-            ex, ey = self.ekf.pos_xy
-        else:
-            theta = 0.0
-            ex, ey = self.latest_gps()
+        # Position source matches the planner — EKF when up,
+        # latest GPS when down. θ comes from heading_offset_est
+        # which automatically uses the closed-form fit when EKF off.
+        theta = self.heading_offset_est
+        ex, ey = self._plan_anchor_xy()
         c = math.cos(theta); s = math.sin(theta)
         dwx = c * dox - s * doy
         dwy = s * dox + c * doy
-        return (ex + dwx, ey + dwy)
+        cand_x = ex + dwx
+        cand_y = ey + dwy
+        # ── GPS-based candidate compensation (last-resort fallback) ──
+        # When the goal-distance invariant has fired, the EKF has
+        # drifted from the real robot in BOTH position and rotation.
+        # We compensate by applying a full rigid-transform correction
+        # to the published candidate so the real robot still arrives
+        # at the goal even though the EKF's pose is wrong.
+        #
+        # Translation:  candidate += (ekf.pos_xy − latest_gps)
+        #     (cancels the EKF's position error)
+        # Rotation:     candidate = ekf.pos_xy
+        #                          + R(Δθ) · (candidate − ekf.pos_xy)
+        #     where Δθ = cog_gps − cog_ekf is the heading discrepancy
+        #     between the algorithm's belief and the course-over-ground
+        #     derived from gps_history. Rotating the candidate around
+        #     the EKF anchor by Δθ cancels the EKF's rotation error.
+        #
+        # The path still anchors on the green EKF virtual robot —
+        # NAV2 / the controller never see latest_gps; they see a
+        # candidate goal already corrected for the EKF's translation
+        # AND rotation error.
+        if (self._gps_fallback_engaged
+                and self.ekf is not None):
+            ex_e, ey_e = self.ekf.pos_xy
+            gps = self.latest_gps()
+            # 1) Translation correction.
+            if gps is not None:
+                cand_x = cand_x + (ex_e - gps[0])
+                cand_y = cand_y + (ey_e - gps[1])
+            # 2) Rotation correction (heading drift).
+            d_theta = self._compute_fallback_heading_error()
+            if d_theta is not None and abs(d_theta) > 1e-4:
+                # Rotate (candidate − ekf.pos_xy) by Δθ around the
+                # EKF anchor so the candidate stays the same DISTANCE
+                # from the EKF robot but pivots to compensate for the
+                # heading error.
+                cR = math.cos(d_theta); sR = math.sin(d_theta)
+                vx = cand_x - ex_e
+                vy = cand_y - ey_e
+                cand_x = ex_e + cR * vx - sR * vy
+                cand_y = ey_e + sR * vx + cR * vy
+        return (cand_x, cand_y)
+
+    def _compute_fallback_heading_error(self):
+        """Returns the EKF's heading-belief error vs course-over-ground
+        derived from gps_history, or ``None`` if there isn't enough
+        recent motion to estimate the course.
+
+        Course-over-ground (CoG) is the world-frame direction the
+        robot has actually been moving in over the last few seconds
+        of GPS readings. The EKF's belief is
+        ``body_heading_imu_fused + ekf.theta`` (= what direction the
+        EKF thinks the body is pointing in world frame). When the EKF
+        is healthy these match; when ``ekf.theta`` has drifted, they
+        diverge by exactly the heading-error the fallback needs to
+        compensate.
+
+        Δθ returned by this method is positive when the EKF thinks
+        the robot is rotated more CCW than it actually is — i.e.,
+        the candidate needs to be rotated CCW by Δθ around the EKF
+        anchor to compensate.
+        """
+        if self.ekf is None or len(self.gps_history) < 8:
+            return None
+        # Use a ~3 s window of GPS history (assumes 10 Hz GPS).
+        n = min(30, len(self.gps_history))
+        old = self.gps_history[-n][1]
+        new = self.gps_history[-1][1]
+        dx = new[0] - old[0]
+        dy = new[1] - old[1]
+        baseline = math.hypot(dx, dy)
+        # Need enough motion for the course estimate to be meaningful
+        # — GPS noise dominates short baselines.
+        if baseline < 1.0:
+            return None
+        cog_gps = math.atan2(dy, dx)
+        cog_ekf = self.body_heading_imu_fused + self.ekf.theta
+        d = (cog_gps - cog_ekf + math.pi) % (2 * math.pi) - math.pi
+        return d
 
     def _update_candidate_smoother(self):
         """Per-tick EWMA update with a 1/r-envelope outlier reject.
@@ -3048,10 +4050,7 @@ class GPSWaypointSim:
             s = math.sin(self.true_heading)
             hx, hy = self._next_hint_world_xy
             return (c * hx - s * hy, s * hx + c * hy)
-        if self.ekf is None:
-            ex, ey = self.latest_gps()
-        else:
-            ex, ey = self.ekf.pos_xy
+        ex, ey = self._plan_anchor_xy()
         vx = self._next_hint_world_xy[0] - ex
         vy = self._next_hint_world_xy[1] - ey
         dtheta = self.true_heading - self.heading_offset_est
@@ -3068,10 +4067,7 @@ class GPSWaypointSim:
         the hint isn't cached yet."""
         if self._next_hint_world_xy is None:
             return None
-        if self.ekf is None:
-            ex, ey = (0.0, 0.0)
-        else:
-            ex, ey = self.ekf.pos_xy
+        ex, ey = self._plan_anchor_xy()
         hx_w, hy_w = self._next_hint_world_xy
         dx_w = hx_w - ex
         dy_w = hy_w - ey
@@ -3230,6 +4226,59 @@ class GPSWaypointSim:
         self._update_stuck()
 
     # -- Stepping --------------------------------------------------------
+    def _seed_coldstart_theta_if_needed(self, goal_world_xy):
+        """improve/gps-waypoint-continuity — one-shot θ_offset snap.
+
+        Port of ``gps_handler_node._seed_coldstart_theta_if_needed``
+        (deployed L1179-1228 on improve/gps-waypoint-continuity).
+        Fires at most once per agent lifetime (guarded by
+        ``self._coldstart_theta_seeded``). The contract:
+
+        On the very first GPS goal accepted while
+        ``self._coldstart_bias_enabled`` is True, compute the
+        θ_offset that would make the world→odom projection of the
+        goal land directly in front of base_link, and snap the EKF
+        to it with ``self._coldstart_theta_seed_var_rad2`` variance.
+        Without this, the wide initial prior (θ_var0 = π²) means
+        the first GPS update Kalman-gains hard onto whatever the
+        lever-arm-corrupted first fix says — convergence in the
+        wrong direction.
+
+        Identity: if we want the rotated world vector
+        ``(gx-ex, gy-ey)`` to align with body forward
+        ``(cos(yaw_o), sin(yaw_o))``, then
+        ``atan2(gy-ey, gx-ex) - θ = yaw_o``,
+        hence ``θ = atan2(gy-ey, gx-ex) - yaw_o``.
+        """
+        if not self._coldstart_bias_enabled:
+            return
+        if self._coldstart_theta_seeded:
+            return
+        if self.ekf is None:
+            return
+        ex, ey = float(self.ekf.x[0]), float(self.ekf.x[1])
+        gx_w, gy_w = float(goal_world_xy[0]), float(goal_world_xy[1])
+        if math.hypot(gx_w - ex, gy_w - ey) < 0.05:
+            # Goal essentially at the robot — no meaningful direction
+            # to seed. Don't burn the one-shot; retry on the next leg.
+            return
+        goal_world_angle = math.atan2(gy_w - ey, gx_w - ex)
+        seed_theta = ((goal_world_angle - self.body_heading + math.pi)
+                      % (2.0 * math.pi)) - math.pi
+        self.ekf.reset_theta(
+            seed_theta,
+            theta_var=self._coldstart_theta_seed_var_rad2,
+        )
+        # EKF-death-surviving path: also seed the closed-form θ
+        # cache. When the EKF is disabled, ``ekf.reset_theta``
+        # writes into a state that never propagates downstream;
+        # we need the seed to live somewhere the projection can
+        # read. ``heading_offset_est`` reads ``_theta_no_ekf``
+        # when EKF is off, so seeding both keeps the cold-start
+        # path identical regardless of EKF state.
+        self._theta_no_ekf = seed_theta
+        self._coldstart_theta_seeded = True
+
     def _advance_to_next_leg(self):
         """Pop the next ``(lat, lon)`` off ``self.goal_queue`` and
         reseat the agent on the new goal — mirrors the per-leg
@@ -3325,6 +4374,13 @@ class GPSWaypointSim:
         next_lat, next_lon = self.goal_queue.pop(0)
         self.goal_world = latlon_to_meters(next_lat, next_lon)
         self.leg_index += 1
+        # improve/gps-waypoint-continuity — re-invoke the one-shot
+        # seed. Deployed calls ``_seed_coldstart_theta_if_needed`` on
+        # every accepted goal (gps_handler_node L2069); the guard
+        # makes it a no-op after the first fire. We mirror that
+        # exactly so the call lives at the goal-acceptance boundary
+        # for parity, even though it only does work once.
+        self._seed_coldstart_theta_if_needed(self.goal_world)
         # improve/gps-waypoint-continuity — promotion check.
         # Mirrors deployed L2074-2094: if the cached hint matches
         # the new leg's goal within ``_hint_match_tolerance_m``,
@@ -3419,9 +4475,19 @@ class GPSWaypointSim:
         # also replan when that target drifts. The closest-point
         # lookahead handles smaller anchor drift without a full
         # re-search.
-        plan_anchor = (self.ekf.pos_xy if self.ekf is not None
-                       else self.latest_gps())
+        # Three localization sources for the planner anchor:
+        #   • EKF on  → plan from EKF posterior (best estimate,
+        #               fuses GPS into world frame)
+        #   • EKF off → plan from ODOM (pure encoder integration,
+        #               treated as if odom-frame ≡ world-frame)
+        #   • no EKF object at all (defensive) → fall back to GPS
+        plan_anchor = self._plan_anchor_xy()
         # Live candidate (computed every step from the EKF — free).
+        # EKF-death-surviving θ refresh — runs BEFORE the candidate
+        # smoother so the projection it consumes has a fresh closed-
+        # form θ when EKF updates are disabled. No-op when EKF is
+        # on (heading_offset_est returns ekf.theta in that case).
+        self._update_theta_no_ekf()
         # First update the EWMA smoother with this tick's raw value,
         # then read the (possibly smoothed) candidate via the public
         # accessor. The smoother snaps through large steps so heading
@@ -3443,7 +4509,51 @@ class GPSWaypointSim:
         # the tick keeps detector ordering consistent with
         # gps_handler_node._odom_callback.
         self._periodic_heading_refit()
+        # Continuous GPS-CoG θ injection (every tick when moving).
+        # This is the primary θ correction: GPS-direction-of-motion
+        # minus IMU-body-yaw — both "truth-grade" sources. ODOM
+        # encoder bias does not contaminate this measurement.
+        self._inject_gps_cog_theta_measurement()
         self._update_local_world_divergence()
+        # 4-heading invariant watchdog — DESIGN_INTENT.md. Runs after
+        # the position-progress divergence detector so the candidate
+        # state it reads is the freshest possible. The two detectors
+        # are complementary: local-vs-world catches radial progress
+        # divergence (robot makes EKF-frame progress that GPS doesn't
+        # confirm), the watchdog catches pure heading drift (the two
+        # θ estimators disagreeing even while the agent makes
+        # progress in both frames).
+        self._update_invariant_watchdog()
+        # Magnitude-ratio invariant — EKF-independent. Even when the
+        # whole EKF chain is off, |GPS Δ| / |odom Δ| should ≈ 1.0
+        # because both frames measure the same physical motion. The
+        # two watchdogs together cover both DOFs of the 2-D rigid
+        # transform between frames (rotation + scale).
+        self._update_magnitude_ratio_watchdog()
+        # Goal-distance magnitude invariant — covers the translation
+        # half of the rigid transform between virtual and real frames.
+        # Fires when the virtual robot has translated away from the
+        # real robot (e.g., odom drifted while EKF is off), so the
+        # candidate-placement still looks consistent in the virtual
+        # frame but the real robot will miss the GPS goal by the
+        # translation error.
+        self._update_goal_distance_watchdog()
+        # Last-resort GPS-anchored fallback engagement — must run
+        # after the watchdogs so it sees their latest fire counts.
+        # Latches one-way (engaged stays engaged for the run).
+        self._update_gps_fallback_engagement()
+        # Body-heading-in-world error vs the EKF's belief — track
+        # max over the entire run so a transient bad heading during
+        # the orbit phase doesn't vanish from the metric once the
+        # EKF eventually corrects.
+        _h_true = self.body_heading_true + self.true_heading
+        _h_est  = self.body_heading + self.heading_offset_est
+        _h_diff = ((_h_true - _h_est + math.pi)
+                    % (2 * math.pi) - math.pi)
+        _h_diff_deg = math.degrees(_h_diff)
+        self._body_theta_err_latest_deg = _h_diff_deg
+        if abs(_h_diff_deg) > self._body_theta_err_max_abs_deg:
+            self._body_theta_err_max_abs_deg = abs(_h_diff_deg)
         live_candidate = self.intermediate_goal_world()
         # Sample the live candidate into `published_goal_world` at
         # NAV2_GOAL_HZ. Everything downstream — A*, replan trigger,
@@ -3464,7 +4574,9 @@ class GPSWaypointSim:
             # the status panel — only its previous-frame value is no
             # longer consulted as the gate.
             if self.ekf is not None:
-                ex, ey = self.ekf.pos_xy
+                # Refinement-lock uses the same position source as
+                # the planner — EKF when up, latest GPS when down.
+                ex, ey = self._plan_anchor_xy()
                 d_goal = math.hypot(ex - self.goal_world[0],
                                     ey - self.goal_world[1])
                 threshold = STOP_REFINE_K * STOP_REFINE_SIGMA_GPS_M
@@ -3517,7 +4629,12 @@ class GPSWaypointSim:
         # agents from hammering A* every tick.
         if need_replan and self.sim_time < self._stuck_until:
             need_replan = False
-        if need_replan and not self.coasting:
+        # Launch-stack toggle: NAV2 down → skip A*. The agent retains
+        # whatever path it already has (typically the very first plan
+        # built at construction); if none exists, ``self.path_world``
+        # stays None and the controller degrades to a goal-direction
+        # bee-line (still subject to obstacle blocking).
+        if need_replan and not self.coasting and NAV2_PLANNING_ENABLE:
             path_new, pad, win = windowed_astar(
                 self.cm, plan_anchor[0], plan_anchor[1],
                 candidate_goal[0], candidate_goal[1],
@@ -3632,9 +4749,18 @@ class GPSWaypointSim:
             cap = 0.0
 
         # ── Chaplygin sleigh control ──────────────────────────────
-        # Heading error in odom: how far the body must rotate to point
-        # at the target direction. Wrap to [-π, π].
-        heading_err = (target_angle_odom - self.body_heading
+        # Heading error in odom: how far the body must rotate to
+        # point at the target direction. Wrap to [-π, π].
+        #
+        # Use ``body_heading_imu_fused`` (= scan-match / IMU yaw)
+        # rather than ``body_heading`` (= encoder yaw). With encoder
+        # bias active, ``body_heading`` = body_heading_true + K·D —
+        # commanding the controller to align that biased value with
+        # the target makes the REAL body heading off by K·D, which
+        # is the source of the 90°-orbit failure mode. The green
+        # arrow on the GUI uses body_heading_imu_fused; the
+        # controller now agrees with the green arrow.
+        heading_err = (target_angle_odom - self.body_heading_imu_fused
                         + math.pi) % (2 * math.pi) - math.pi
         # Forward speed setpoint: scaled by alignment so the body
         # doesn't drive forward when the target is behind it. Pure
@@ -3718,10 +4844,23 @@ class GPSWaypointSim:
         self.body_heading_true = ((self.body_heading_true
                                     + self.angular_vel * dt
                                     + math.pi) % (2 * math.pi) - math.pi)
-        if LIDAR_IMU_FUSION_ENABLE:
+        # ``self.body_heading`` is the heading the controller reads
+        # as "where the body is pointing." It MUST match whichever
+        # virtual robot the planner is using:
+        #   • EKF on  → planner uses EKF (IMU-fused). body_heading
+        #               tracks IMU-corrected heading (= truth here,
+        #               since the sim models the IMU as ideal).
+        #   • EKF off → planner uses ODOM (raw encoders). body_heading
+        #               tracks the always-biased encoder reading so
+        #               the controller misaims by exactly the bias.
+        # The bias rate is ALWAYS ``ODOM_YAW_BIAS_RAD_PER_M`` when
+        # the planner is on ODOM — the physical wheel-encoder bias
+        # doesn't disappear because the operator left
+        # ``ODOM_YAW_BIAS_ENABLE = False`` in some other context.
+        if GPS_HEADING_EKF_ENABLE and LIDAR_IMU_FUSION_ENABLE:
             K_eff = 0.0
         else:
-            K_eff = self._odom_yaw_bias_rate
+            K_eff = ODOM_YAW_BIAS_RAD_PER_M
         self._yaw_bias_offset += K_eff * abs(self.forward_vel) * dt
         self.body_heading = ((self.body_heading_true
                                 + self._yaw_bias_offset
@@ -3735,6 +4874,53 @@ class GPSWaypointSim:
         self.odom_vel[1] = self.forward_vel * sh_rep
         self.odom[0] += self.odom_vel[0] * dt
         self.odom[1] += self.odom_vel[1] * dt
+
+        # ── Parallel ODOM/EKF integrations for the 3-robot view ──
+        # Track BOTH bias-accumulated AND IMU-fused integrations
+        # in parallel each tick. These are the values the blue ODOM
+        # and green EKF virtual robots are drawn from — they are
+        # ALWAYS computed independently of any toggle.
+        #
+        # ``K_enc`` uses ``ODOM_YAW_BIAS_RAD_PER_M`` directly, NOT
+        # ``self._odom_yaw_bias_rate``: the encoders are physically
+        # biased on the real robot regardless of whether the
+        # operator has enabled "bias modeling" elsewhere in the sim,
+        # so the blue ODOM robot must drift in every configuration.
+        # The per-agent ``self._odom_yaw_bias_rate`` only governs the
+        # planner-facing ``self.odom`` stream so a "perfect-movement"
+        # twin can still be spawned for A/B comparisons.
+        K_enc = ODOM_YAW_BIAS_RAD_PER_M         # always biased
+        K_imu = 0.0                              # ideal IMU fusion;
+                                                  # add tiny drift here
+                                                  # if you want IMU
+                                                  # bias modeled too
+        self._yaw_bias_offset_encoders += (
+            K_enc * abs(self.forward_vel) * dt)
+        self._yaw_bias_offset_imu += (
+            K_imu * abs(self.forward_vel) * dt)
+        heading_enc = ((self.body_heading_true
+                        + self._yaw_bias_offset_encoders
+                        + math.pi) % (2 * math.pi) - math.pi)
+        heading_imu = ((self.body_heading_true
+                        + self._yaw_bias_offset_imu
+                        + math.pi) % (2 * math.pi) - math.pi)
+        # Persist for the GUI: these are the headings the ODOM and
+        # EKF (IMU-fused) virtual robots think the body is at, in
+        # the robot's own (odom) frame. The visualizer adds
+        # ``true_heading`` to project them into world for display.
+        self.body_heading_encoders = heading_enc
+        self.body_heading_imu_fused = heading_imu
+        # Both integrate the same forward_vel (encoders report the
+        # same wheel rate to both estimators), differing only in
+        # which heading they integrate against.
+        self.odom_encoders_only[0] += (
+            self.forward_vel * math.cos(heading_enc) * dt)
+        self.odom_encoders_only[1] += (
+            self.forward_vel * math.sin(heading_enc) * dt)
+        self.odom_imu_fused[0] += (
+            self.forward_vel * math.cos(heading_imu) * dt)
+        self.odom_imu_fused[1] += (
+            self.forward_vel * math.sin(heading_imu) * dt)
 
         # ── True-world motion: integrate forward velocity along
         # the TRUE body axis, then rotate by `true_heading` (the
@@ -3794,36 +4980,33 @@ class GPSWaypointSim:
             and abs(self.angular_vel) < 0.01)
         if self.ekf is not None and not body_at_rest:
             self.ekf.predict(true_dxo, true_dyo, dt)
+            # Anisotropic dropout-aware covariance growth — see the
+            # ``EKF_DROPOUT_VAR_FWD/LAT_PER_S`` constants. Lateral
+            # growth dominates because lateral error scales with
+            # distance · heading-uncertainty, whereas forward error
+            # is constrained by wheel-encoder distance. Rotates with
+            # the EKF's heading belief so the ellipse stretches
+            # along the right axis even when the body has turned.
+            if new_gps is None:
+                h = self.body_heading_imu_fused + self.ekf.theta
+                ch = math.cos(h); sh = math.sin(h)
+                fwd_var = EKF_DROPOUT_VAR_FWD_PER_S * dt
+                lat_var = EKF_DROPOUT_VAR_LAT_PER_S * dt
+                # ΔP = fwd_var·f·f^T + lat_var·l·l^T, with
+                # f = (ch, sh), l = (-sh, ch).
+                d00 = fwd_var * ch * ch + lat_var * sh * sh
+                d11 = fwd_var * sh * sh + lat_var * ch * ch
+                d01 = (fwd_var - lat_var) * ch * sh
+                self.ekf.P[0, 0] += d00
+                self.ekf.P[1, 1] += d11
+                self.ekf.P[0, 1] += d01
+                self.ekf.P[1, 0] += d01
             if new_gps is not None:
                 # During bootstrap the EKF linearization is unreliable —
                 # don't gate (gate_chi2 huge), and replace θ in-place
                 # with a closed-form estimate so the next predict/update
                 # is linearized around a near-truth point.
-                if not GPS_HEADING_EKF_ENABLE:
-                    # GPS-heading EKF disabled — mirrors the May 9
-                    # field configuration where the deployed robot
-                    # was running PURE wheel odom against a goal
-                    # expressed in odom frame, with no GPS feedback
-                    # in the loop at all. We deliberately do NOT
-                    # call ``self.ekf.update`` here: applying a GPS
-                    # position update would re-pull ekf.pos toward
-                    # truth every tick, which makes the candidate
-                    # (= odom + (goal_world − ekf.pos)) chase a
-                    # moving target and produce a spiral. The IRL
-                    # signature was instead a *straight line* from
-                    # start to a wrong-frame endpoint — that's what
-                    # pure odom + a fixed map-↔-world rotation
-                    # gives. We still pin ekf.theta = 0 (the robot
-                    # had no θ estimate) and reset its covariance
-                    # to a wide prior so the cascade detectors
-                    # behave sensibly if they're sampled.
-                    self.ekf.x[2] = 0.0
-                    self.ekf.P[2, 0] = 0.0
-                    self.ekf.P[0, 2] = 0.0
-                    self.ekf.P[2, 1] = 0.0
-                    self.ekf.P[1, 2] = 0.0
-                    self.ekf.P[2, 2] = math.radians(60.0) ** 2
-                elif not self.bootstrap_done:
+                if not self.bootstrap_done:
                     # DEAD BRANCH — matches deployed L871 on
                     # ``origin/improve/gps-waypoint-continuity``.
                     # ``bootstrap_done`` is initialized True from
@@ -3982,10 +5165,10 @@ class GPSWaypointSim:
                 # off. With EKF on, ekf.pos tracks truth via GPS
                 # and the check fires only when truth is at the
                 # goal — the corrected behaviour.
-                if self.ekf is not None:
-                    rx, ry = self.ekf.pos_xy
-                else:
-                    rx, ry = self.odom[0], self.odom[1]
+                # Same plan_anchor source — robot's "I think I
+                # arrived" check uses EKF position when up, ODOM
+                # when down (treating odom-frame as world-frame).
+                rx, ry = self._plan_anchor_xy()
                 d_robot_local = math.hypot(
                     rx - self.goal_world[0],
                     ry - self.goal_world[1])
@@ -4026,7 +5209,28 @@ class GPSWaypointSim:
                         d_gps = math.hypot(
                             gps_xy[0] - self.goal_world[0],
                             gps_xy[1] - self.goal_world[1])
-                        arrived_now = d_gps < GOAL_RADIUS
+                        # DESIGN_INTENT.md gate: arrival requires
+                        # BOTH the GPS proximity check AND the goal
+                        # being inside the EKF's covariance ellipse.
+                        # Without the χ² gate, a GPS bias can shift
+                        # the reading enough to declare arrival while
+                        # the EKF's own belief says "uncertain". The
+                        # Mahalanobis cap is conservative (χ² ≈ 5.99
+                        # = 95% confidence ellipse); the EKF must
+                        # have settled tight enough that the goal is
+                        # inside that ellipse.
+                        #
+                        # EKF-death-surviving fallback: when EKF is
+                        # off, ``_compute_arrival_mahalanobis`` returns
+                        # NaN. Skip the χ² check in that case — local
+                        # + GPS distance alone are the arrival signals
+                        # available.
+                        mahalan = self._compute_arrival_mahalanobis()
+                        chi2_ok = (
+                            mahalan != mahalan  # NaN
+                            or mahalan < self._ARRIVAL_MAHALAN_CHI2)
+                        arrived_now = (d_gps < GOAL_RADIUS
+                                       and chi2_ok)
                 else:
                     arrived_now = False
             else:
@@ -4099,6 +5303,27 @@ class GPSWaypointSim:
 
 # ── GUI ──────────────────────────────────────────────────────────
 class GPSWaypointGUI:
+    @staticmethod
+    def _make_triangle_vertices(cx, cy, heading_world,
+                                 r_front=None, r_back=None):
+        """Return three (x, y) vertices for an isoceles triangle
+        centered at ``(cx, cy)`` pointing in ``heading_world`` (rad
+        in world frame). Front length matches the real-robot circle
+        radius so the three robot species read at the same scale."""
+        if r_front is None:
+            r_front = ROBOT_RADIUS * 1.2
+        if r_back is None:
+            r_back = ROBOT_RADIUS * 0.7
+        c = math.cos(heading_world)
+        s = math.sin(heading_world)
+        # Local vertices: pointed nose at (+r_front, 0), back corners
+        # at (-r_back/2, ±r_back).
+        verts_local = [(r_front, 0.0),
+                       (-r_back * 0.6, +r_back),
+                       (-r_back * 0.6, -r_back)]
+        return [(cx + c * vx - s * vy, cy + s * vx + c * vy)
+                for (vx, vy) in verts_local]
+
     def __init__(self, sim, obstacles, args,
                  roofs=(), projectors=(),
                  jammers=(), foliage=(), spoofers=(),
@@ -4161,6 +5386,61 @@ class GPSWaypointGUI:
         for s in self.ax.spines.values():
             s.set_edgecolor("#444")
         self.ax.grid(True, color="#163020", linestyle=":", linewidth=0.4)
+
+        # ── Robot-world (odom-frame) grid overlay ─────────────────
+        # The robot's algorithm operates in its odom frame, which
+        # generally does NOT align with the world frame: it's
+        # translated to the agent's start and rotated by the agent's
+        # initial true_heading. When EKF is on and converged, the
+        # gps_handler EKF estimates this rotation (θ) accurately, so
+        # candidate placement maps odom positions back to world
+        # positions correctly. When EKF is off (or unstable), the
+        # rotation is unknown / wrong and the published candidate
+        # points to a different world position than expected — the
+        # GPS-anchored fallback's job is to keep nudging the candidate
+        # so the robot still reaches the real goal despite the
+        # frame mismatch.
+        #
+        # Drawing the odom grid in 0.25-α gray makes the frame
+        # mismatch immediately visible: when the gray grid is tilted
+        # relative to the green world grid, that tilt IS the value
+        # the algorithm has to estimate and correct for.
+        c_h = math.cos(sim.true_heading)
+        s_h = math.sin(sim.true_heading)
+        ox0, oy0 = sim.start_world
+        grid_step = 10.0      # m — coarse enough to read at zoom-out
+        grid_extent = MAP_HALF * 1.5
+        # Build the grid as projected odom-frame lines. Lines along
+        # the odom x-axis (parallel in odom) become parallel in world
+        # under R(true_heading). Lines along odom y-axis ditto.
+        self.robot_world_grid_lines = []
+        n = int(grid_extent / grid_step)
+        for k in range(-n, n + 1):
+            d = k * grid_step
+            # Line parallel to odom x-axis at odom y = d
+            xs_o = (-grid_extent, grid_extent)
+            ys_o = (d, d)
+            xw0 = ox0 + c_h * xs_o[0] - s_h * ys_o[0]
+            yw0 = oy0 + s_h * xs_o[0] + c_h * ys_o[0]
+            xw1 = ox0 + c_h * xs_o[1] - s_h * ys_o[1]
+            yw1 = oy0 + s_h * xs_o[1] + c_h * ys_o[1]
+            ln, = self.ax.plot(
+                [xw0, xw1], [yw0, yw1],
+                color="#cccccc", linestyle="-",
+                linewidth=0.4, alpha=0.25, zorder=1)
+            self.robot_world_grid_lines.append(ln)
+            # Line parallel to odom y-axis at odom x = d
+            xs_o = (d, d)
+            ys_o = (-grid_extent, grid_extent)
+            xw0 = ox0 + c_h * xs_o[0] - s_h * ys_o[0]
+            yw0 = oy0 + s_h * xs_o[0] + c_h * ys_o[0]
+            xw1 = ox0 + c_h * xs_o[1] - s_h * ys_o[1]
+            yw1 = oy0 + s_h * xs_o[1] + c_h * ys_o[1]
+            ln, = self.ax.plot(
+                [xw0, xw1], [yw0, yw1],
+                color="#cccccc", linestyle="-",
+                linewidth=0.4, alpha=0.25, zorder=1)
+            self.robot_world_grid_lines.append(ln)
 
         # Scenario-specific patches live in this list so R-reset can
         # tear them down without rebuilding the figure. Populated at
@@ -4240,11 +5520,92 @@ class GPSWaypointGUI:
             "", xy=(0, 0), xytext=(0, 0),
             arrowprops=dict(arrowstyle="->", color="#ff8080",
                             lw=1.3), zorder=13)
-        # EKF position estimate (smoothed)
-        self.ekf_marker, = self.ax.plot(
-            [], [], "o", color="#9bff9b", markersize=7,
-            markeredgecolor="black", markeredgewidth=0.5,
-            zorder=11)
+        # ── Heading-belief arrows from the red robot ──────────────
+        # Three overlay arrows emanating from the true robot, each
+        # showing one of the three "what does the system think the
+        # body is pointing in world frame?" estimates. Drawn from
+        # the red marker so the user can see at a glance which
+        # estimate diverges and by how much.
+        #   • Blue:   ODOM-only belief (encoder yaw, biased)
+        #   • Yellow: GPS course-over-ground (truth-grade direction)
+        #   • Green:  EKF belief (= IMU body heading + ekf.theta)
+        # The truth arrow (above) is red; if all four overlap, the
+        # estimators are consistent.
+        self.heading_arrow_odom = self.ax.annotate(
+            "", xy=(0, 0), xytext=(0, 0),
+            arrowprops=dict(arrowstyle="->", color="#3aaaff",
+                            lw=1.2, alpha=0.85), zorder=13)
+        self.heading_arrow_gps = self.ax.annotate(
+            "", xy=(0, 0), xytext=(0, 0),
+            arrowprops=dict(arrowstyle="->", color="#ffe14a",
+                            lw=1.2, alpha=0.85), zorder=13)
+        self.heading_arrow_ekf_at_real = self.ax.annotate(
+            "", xy=(0, 0), xytext=(0, 0),
+            arrowprops=dict(arrowstyle="->", color="#33ff66",
+                            lw=1.2, alpha=0.85), zorder=13)
+        # ── Virtual robot bodies (EKF: green, ODOM: blue) ────────
+        # Same circle-body + heading-arrow style as the red truth
+        # robot. Both are always constructed; the per-frame draw
+        # positions them from their respective integrations:
+        #   • EKF body  ← ekf.pos_xy, ekf.theta + body_heading_imu_fused
+        #   • ODOM body ← sim.odom_encoders_only projected to world,
+        #                  body_heading_encoders + true_heading
+        # Visibility is independent of the planner's anchor choice
+        # — both virtual robots integrate every tick regardless.
+        self.ekf_robot_body = Circle((0, 0), ROBOT_RADIUS,
+                                      facecolor="#33ff66",
+                                      edgecolor="white",
+                                      linewidth=1.0, alpha=0.55,
+                                      zorder=11)
+        self.ax.add_patch(self.ekf_robot_body)
+        # EKF position covariance — rendered as a stack of three
+        # concentric ellipses at the 1σ / 2σ / 3σ contours of the
+        # 2D Gaussian, with decreasing alpha. This gives the
+        # "gaussian density" look: the green body is most opaque at
+        # the center, and the cloud fades out at the 3σ boundary.
+        # Each ellipse's axes are 2·√(s · λ_i) where s ∈ {1, 4, 9}
+        # (χ²₂ levels for 1σ, 2σ, 3σ in 2D), and λ_i are the
+        # eigenvalues of P[0:2, 0:2]. The whole stack rotates with
+        # the principal-axis orientation each frame.
+        self.ekf_cov_ellipses = []
+        for sigma_level, alpha_level in ((1.0, 0.22),
+                                          (2.0, 0.14),
+                                          (3.0, 0.08)):
+            ell = Ellipse(
+                (0, 0), width=0.1, height=0.1, angle=0.0,
+                facecolor="#33ff66", edgecolor="none",
+                alpha=alpha_level, zorder=9)
+            ell._sigma_level = sigma_level
+            self.ax.add_patch(ell)
+            self.ekf_cov_ellipses.append(ell)
+        # Keep the singular-name attribute pointing at the 1σ
+        # contour for legacy code paths that may reference it.
+        self.ekf_cov_ellipse = self.ekf_cov_ellipses[0]
+        self.odom_robot_body = Circle((0, 0), ROBOT_RADIUS,
+                                       facecolor="#3aaaff",
+                                       edgecolor="white",
+                                       linewidth=1.0, alpha=0.55,
+                                       zorder=11)
+        self.ax.add_patch(self.odom_robot_body)
+        # Heading arrow for the ODOM virtual robot — same arrowstyle
+        # as the red truth robot and the green EKF heading arrow.
+        # Points along the encoder-reported body heading (which is
+        # biased relative to truth and visibly diverges over time).
+        self.odom_heading_arrow = self.ax.annotate(
+            "", xy=(0, 0), xytext=(0, 0),
+            arrowprops=dict(arrowstyle="->", color="#3aaaff",
+                            lw=1.3, alpha=0.85), zorder=13)
+        # Compatibility shims — older code paths and bake-mp4 still
+        # call .set_data on ``ekf_marker`` / ``odom_marker``. Keep
+        # them as zero-area line stubs so those calls are no-ops.
+        self.ekf_marker, = self.ax.plot([], [], "o",
+                                         color="#33ff66",
+                                         markersize=0, alpha=0.0,
+                                         zorder=11)
+        self.odom_marker, = self.ax.plot([], [], "D",
+                                          color="#3aaaff",
+                                          markersize=0, alpha=0.0,
+                                          zorder=11)
         # EKF heading arrow — agent's BELIEF about its body's
         # world-frame heading: ``body_heading + ekf.theta`` (the
         # rotation between odom and world that the EKF estimates).
@@ -4398,7 +5759,10 @@ class GPSWaypointGUI:
                          self.gps_scatter, self.belief_cloud,
                          self.belief_mean_marker,
                          self.intermediate_marker,
-                         self.ekf_marker,
+                         self.ekf_marker, self.odom_marker,
+                         self.ekf_robot_body, self.odom_robot_body,
+                         *self.ekf_cov_ellipses,
+                         self.odom_heading_arrow,
                          self.compass_ring):
                 art.set_visible(False)
             self.compass_real_arrow.set_visible(False)
@@ -4489,6 +5853,23 @@ class GPSWaypointGUI:
             "", xy=(0, 0), xytext=(0, 0),
             arrowprops=dict(arrowstyle="->", color="#ff8080",
                              lw=1.3), zorder=13)
+        # Three belief-arrows from the red robot on the follow-cam
+        # (same semantics as on the main map): blue=ODOM, yellow=GPS
+        # course-over-ground, green=EKF. The mini-cam is centered on
+        # the truth body, so all four arrows share the (0, 0) origin
+        # — the angles tell the story directly.
+        self.mini_heading_arrow_odom = self.ax_mini.annotate(
+            "", xy=(0, 0), xytext=(0, 0),
+            arrowprops=dict(arrowstyle="->", color="#3aaaff",
+                             lw=1.2, alpha=0.85), zorder=13)
+        self.mini_heading_arrow_gps = self.ax_mini.annotate(
+            "", xy=(0, 0), xytext=(0, 0),
+            arrowprops=dict(arrowstyle="->", color="#ffe14a",
+                             lw=1.2, alpha=0.85), zorder=13)
+        self.mini_heading_arrow_ekf = self.ax_mini.annotate(
+            "", xy=(0, 0), xytext=(0, 0),
+            arrowprops=dict(arrowstyle="->", color="#33ff66",
+                             lw=1.2, alpha=0.85), zorder=13)
         self.mini_ekf_marker, = self.ax_mini.plot(
             [], [], "o", color="#9bff9b", markersize=8,
             markeredgecolor="black", markeredgewidth=0.5, zorder=11)
@@ -4844,7 +6225,7 @@ class GPSWaypointGUI:
                                  self.gps_scatter, self.belief_cloud,
                                  self.belief_mean_marker,
                                  self.intermediate_marker,
-                                 self.ekf_marker,
+                                 self.ekf_marker, self.odom_marker,
                                  self.compass_ring,
                                  self.compass_real_arrow,
                                  self.compass_est_arrow,
@@ -4878,6 +6259,16 @@ class GPSWaypointGUI:
         self.belief_mean_marker.set_data([], [])
         self.intermediate_marker.set_data([], [])
         self.ekf_marker.set_data([], [])
+        # Park virtual-robot circles on the truth body for one frame;
+        # the next draw will re-position them per their own
+        # integrations. Both stay visible across resets.
+        self.odom_robot_body.center = (sim.true_pos[0], sim.true_pos[1])
+        self.ekf_robot_body.center = (sim.true_pos[0], sim.true_pos[1])
+        self.odom_heading_arrow.xy = (sim.true_pos[0], sim.true_pos[1])
+        self.odom_heading_arrow.set_position(
+            (sim.true_pos[0], sim.true_pos[1]))
+        self.ekf_robot_body.set_visible(True)
+        self.odom_robot_body.set_visible(True)
         self.mini_path_line.set_data([], [])
         self.mini_gps_scatter.set_offsets(np.empty((0, 2)))
         self.mini_trail_line.set_data([], [])
@@ -5005,6 +6396,59 @@ class GPSWaypointGUI:
         self.heading_arrow.set_position(
             (sim.true_pos[0], sim.true_pos[1]))
 
+        # ── Three heading-belief arrows emanating from the red robot ──
+        # Blue:   ODOM-only world heading = encoder body heading + R(odom→world)
+        #         Encoder heading is biased; R is taken as true_heading (the
+        #         sim's "what direction is north relative to odom" oracle —
+        #         the agent's algorithm doesn't know this, but the sim
+        #         displays it for diagnostic comparison).
+        # Yellow: GPS course-over-ground (atan2 of last ~3s of GPS deltas).
+        #         The most truth-grade DIRECTION-OF-MOTION the algorithm has
+        #         access to; doesn't depend on odom at all.
+        # Green:  EKF belief of body heading in world = body_heading + ekf.theta.
+        odom_world_heading = (sim.body_heading_encoders
+                               + sim.true_heading)
+        self.heading_arrow_odom.xy = (
+            sim.true_pos[0] + ah * math.cos(odom_world_heading),
+            sim.true_pos[1] + ah * math.sin(odom_world_heading))
+        self.heading_arrow_odom.set_position(
+            (sim.true_pos[0], sim.true_pos[1]))
+        # GPS CoG — only meaningful if we have enough recent motion.
+        cog_dir = None
+        if len(sim.gps_history) >= 8:
+            n = min(30, len(sim.gps_history))
+            old_g = sim.gps_history[-n][1]
+            new_g = sim.gps_history[-1][1]
+            ddx = new_g[0] - old_g[0]
+            ddy = new_g[1] - old_g[1]
+            if math.hypot(ddx, ddy) >= 1.0:
+                cog_dir = math.atan2(ddy, ddx)
+        if cog_dir is not None:
+            self.heading_arrow_gps.xy = (
+                sim.true_pos[0] + ah * math.cos(cog_dir),
+                sim.true_pos[1] + ah * math.sin(cog_dir))
+            self.heading_arrow_gps.set_position(
+                (sim.true_pos[0], sim.true_pos[1]))
+            self.heading_arrow_gps.set_visible(True)
+        else:
+            self.heading_arrow_gps.set_visible(False)
+        # EKF's belief of body's world heading. The body heading in
+        # ODOM frame comes from the IMU/scan-match (clean, no
+        # encoder bias); the EKF adds its θ estimate (= rotation
+        # odom→world). This is the value the deployed robot would
+        # consume from /local_ekf/odom + gps_handler.theta — using
+        # ``sim.body_heading`` (encoder yaw) here would conflate
+        # "EKF is wrong" with "encoder is biased" and the arrow
+        # would track the blue ODOM arrow even when ekf.theta is
+        # actually correct.
+        ekf_world_heading = (sim.body_heading_imu_fused
+                              + sim.heading_offset_est)
+        self.heading_arrow_ekf_at_real.xy = (
+            sim.true_pos[0] + ah * math.cos(ekf_world_heading),
+            sim.true_pos[1] + ah * math.sin(ekf_world_heading))
+        self.heading_arrow_ekf_at_real.set_position(
+            (sim.true_pos[0], sim.true_pos[1]))
+
         # EKF heading arrow — anchored at ekf.pos, pointing along
         # the body's BELIEVED world heading (= body_heading +
         # ekf.theta). With healthy IMU fusion in the local EKF,
@@ -5055,8 +6499,10 @@ class GPSWaypointGUI:
             ty = [p[1] for p in sim.true_trail]
             self.trail_line.set_data(tx, ty)
 
-        # A* path (planned in world frame from ekf.pos to the
-        # published candidate).
+        # A* path. ``plan_anchor`` is always in world coords (the
+        # planner picks ekf.pos_xy when EKF on or the ODOM virtual
+        # robot's world position when EKF off — both are in true
+        # world), so the path is rendered as-is.
         if sim.path_world:
             px = [p[0] for p in sim.path_world]
             py = [p[1] for p in sim.path_world]
@@ -5087,14 +6533,83 @@ class GPSWaypointGUI:
             self.belief_cloud.set_offsets(np.empty((0, 2)))
             self.belief_mean_marker.set_data([], [])
 
-        # EKF position estimate
+        # ── Virtual-robot markers (path always spawns from one of these) ──
+        # The planner's anchor (``_plan_anchor_xy``) is the world-frame
+        # position the A* path is rooted at. To make "where the path
+        # starts" visually unambiguous, both markers below track the
+        # ACTUAL anchor:
+        #   • EKF on, no fallback     → green = ekf.pos_xy
+        #   • EKF off, no fallback    → green hidden;
+        #                                cyan = sim.odom (in world)
+        #   • Fallback engaged        → green = latest_gps
+        #                                (algorithm's GPS-based belief
+        #                                — not the same as the red truth
+        #                                marker even though they often
+        #                                visually overlap)
+        # The cyan ODOM diamond ALWAYS shows ``sim.odom`` projected to
+        # world (= what the planner would use if EKF / fallback both
+        # went away). This makes the drift between virtual ODOM and
+        # the real robot visible across all configurations.
+        c_w, s_w = math.cos(sim.true_heading), math.sin(sim.true_heading)
+        # ── Blue ODOM virtual robot (always visible, EKF-independent) ──
+        # Position = ``sim.odom_encoders_only`` (raw wheel-encoder
+        # integration, always biased) projected into world via
+        # R(true_heading). Heading = encoder-reported body heading
+        # rotated into world. The blue circle + blue arrow always
+        # render in the same style as the red truth robot, and
+        # always drift independently regardless of which anchor the
+        # planner is using.
+        o_enc = sim.odom_encoders_only
+        odom_world_x = sim.start_world[0] + c_w * o_enc[0] - s_w * o_enc[1]
+        odom_world_y = sim.start_world[1] + s_w * o_enc[0] + c_w * o_enc[1]
+        odom_heading_world = sim.body_heading_encoders + sim.true_heading
+        self.odom_robot_body.center = (odom_world_x, odom_world_y)
+        self.odom_heading_arrow.xy = (
+            odom_world_x + ah * math.cos(odom_heading_world),
+            odom_world_y + ah * math.sin(odom_heading_world))
+        self.odom_heading_arrow.set_position(
+            (odom_world_x, odom_world_y))
+        # ── Green EKF virtual robot (always visible when EKF exists) ──
+        # Position = ``ekf.pos_xy`` (gps_handler EKF posterior).
+        # Heading arrow is the pre-existing ``ekf_heading_arrow``
+        # (set up further down). The EKF keeps fusing GPS even
+        # when the toggle says "EKF off" — only the planner anchor
+        # changes.
         if sim.ekf is not None:
-            ex, ey = sim.ekf.pos_xy
-            self.ekf_marker.set_data([ex], [ey])
+            ex_a, ey_a = sim.ekf.pos_xy
+            self.ekf_robot_body.center = (ex_a, ey_a)
+            self.ekf_robot_body.set_visible(True)
+            # Eigen-decompose P[0:2, 0:2] once and reuse for all
+            # three sigma contours.
+            P2 = sim.ekf.P[:2, :2]
+            a, b = float(P2[0, 0]), float(P2[1, 1])
+            c_xy = float(P2[0, 1])
+            tr = a + b
+            det = a * b - c_xy * c_xy
+            disc = max(0.0, (tr * 0.5) ** 2 - det)
+            sqrt_disc = math.sqrt(disc)
+            lam1 = max(tr * 0.5 + sqrt_disc, 1e-6)
+            lam2 = max(tr * 0.5 - sqrt_disc, 1e-6)
+            std1 = math.sqrt(lam1)
+            std2 = math.sqrt(lam2)
+            angle = math.degrees(0.5 * math.atan2(2.0 * c_xy, a - b))
+            # Each contour at s standard deviations along the
+            # principal axes (width/height are full axis lengths,
+            # i.e. 2·s·std). The 1σ / 2σ / 3σ stack produces the
+            # gaussian-density look.
+            for ell in self.ekf_cov_ellipses:
+                s_lvl = ell._sigma_level
+                ell.center = (ex_a, ey_a)
+                ell.width  = 2.0 * s_lvl * std1
+                ell.height = 2.0 * s_lvl * std2
+                ell.angle = angle
+                ell.set_visible(True)
         else:
-            self.ekf_marker.set_data([], [])
+            self.ekf_robot_body.set_visible(False)
+            for ell in self.ekf_cov_ellipses:
+                ell.set_visible(False)
 
-        # Intermediate goal
+        # Intermediate goal — published candidate in world frame.
         # Yellow X tracks the *published* goal (what NAV2 / A* are
         # actually driving toward), not the live per-tick candidate.
         # The live candidate is implicit in the cloud's volatility.
@@ -5134,6 +6649,37 @@ class GPSWaypointGUI:
         self.mini_heading_arrow.xy = (ah * math.cos(motion_dir),
                                        ah * math.sin(motion_dir))
         self.mini_heading_arrow.set_position((0.0, 0.0))
+        # Three belief-arrows on the follow-cam, anchored at the
+        # red robot's origin (0, 0). Same colours and semantics as
+        # the main-map versions.
+        odom_world_h = sim.body_heading_encoders + sim.true_heading
+        self.mini_heading_arrow_odom.xy = (ah * math.cos(odom_world_h),
+                                            ah * math.sin(odom_world_h))
+        self.mini_heading_arrow_odom.set_position((0.0, 0.0))
+        cog_dir = None
+        if len(sim.gps_history) >= 8:
+            n = min(30, len(sim.gps_history))
+            old_g = sim.gps_history[-n][1]
+            new_g = sim.gps_history[-1][1]
+            ddx = new_g[0] - old_g[0]
+            ddy = new_g[1] - old_g[1]
+            if math.hypot(ddx, ddy) >= 1.0:
+                cog_dir = math.atan2(ddy, ddx)
+        if cog_dir is not None:
+            self.mini_heading_arrow_gps.xy = (ah * math.cos(cog_dir),
+                                               ah * math.sin(cog_dir))
+            self.mini_heading_arrow_gps.set_position((0.0, 0.0))
+            self.mini_heading_arrow_gps.set_visible(True)
+        else:
+            self.mini_heading_arrow_gps.set_visible(False)
+        # IMU-fused yaw + ekf.theta (= EKF's belief of body-in-world).
+        # See main-axis copy for why this must NOT use the
+        # encoder-biased ``sim.body_heading``.
+        ekf_world_h = (sim.body_heading_imu_fused
+                        + sim.heading_offset_est)
+        self.mini_heading_arrow_ekf.xy = (ah * math.cos(ekf_world_h),
+                                           ah * math.sin(ekf_world_h))
+        self.mini_heading_arrow_ekf.set_position((0.0, 0.0))
 
         if sim.true_trail:
             self.mini_trail_line.set_data(
@@ -5156,7 +6702,7 @@ class GPSWaypointGUI:
         else:
             self.mini_gps_scatter.set_offsets(np.empty((0, 2)))
 
-        if sim.ekf is not None:
+        if sim.ekf is not None and GPS_HEADING_EKF_ENABLE:
             ex, ey = sim.ekf.pos_xy
             self.mini_ekf_marker.set_data([ex - rx], [ey - ry])
         else:
@@ -5236,7 +6782,7 @@ class GPSWaypointGUI:
             self.goalcam_intermediate.set_data([gx], [gy])
             self.goalcam_robot.center = (sim.true_pos[0],
                                           sim.true_pos[1])
-            if sim.ekf is not None:
+            if sim.ekf is not None and GPS_HEADING_EKF_ENABLE:
                 ex, ey = sim.ekf.pos_xy
                 self.goalcam_ekf_marker.set_data([ex], [ey])
             else:
@@ -5367,7 +6913,31 @@ class GPSWaypointGUI:
             )
         else:
             mission_lines = ""
+        # Algorithm-mode tag — what the planner is currently anchored
+        # on. Switches one-way from Stable → Degraded if a watchdog
+        # latches the GPS-fallback. ODOM-Only means the algorithm has
+        # no fallback available (user disabled it) and is running
+        # open-loop on biased odom.
+        if getattr(sim, "_gps_fallback_engaged", False):
+            algo_tag = "[EKF Degraded Algorithm]"
+            algo_color = "#ffb84a"
+        elif GPS_HEADING_EKF_ENABLE and sim.ekf is not None:
+            algo_tag = "[EKF Stable Algorithm]"
+            algo_color = "#9bff9b"
+        else:
+            algo_tag = "[ODOM-Only Algorithm]"
+            algo_color = "#ff6060"
+        # ── Body-heading-in-world error: truth vs EKF belief ─────
+        # (Sim-only measurement — the deployed robot can't directly
+        # observe this. Surfaced here because it's the metric that
+        # drives orbiting: if EKF body-heading-belief is off by Δ,
+        # the robot circles the goal at radius ~ Δ · goal_dist.)
+        _h_true = sim.body_heading_true + sim.true_heading
+        _h_est = sim.body_heading + sim.heading_offset_est
+        _h_diff_rad = (_h_true - _h_est + math.pi) % (2 * math.pi) - math.pi
+        _h_diff_deg = math.degrees(_h_diff_rad)
         body = (
+            f"{algo_tag}\n"
             f"t = {sim.sim_time:6.1f} s   {state}\n"
             f"GPS: {gps_state}\n"
             + ens_lines +
@@ -5381,6 +6951,8 @@ class GPSWaypointGUI:
             f"\n"
             f"── EKF ────────────────\n"
             f"σ_θ             {ekf_tstd:6.2f}°\n"
+            f"|body θ − truth| {abs(_h_diff_deg):5.2f}° ({_h_diff_deg:+6.2f}°)\n"
+            f"|body θ − truth|max {getattr(sim, '_body_theta_err_max_abs_deg', 0.0):5.2f}°\n"
             f"σ_pos       {ekf_pstd[0]:4.2f}, {ekf_pstd[1]:4.2f} m\n"
             f"updates / rej   {ekf_upd:>4} / {ekf_rej}\n"
             f"bootstrap       {boot}\n"
@@ -5406,6 +6978,9 @@ class GPSWaypointGUI:
         arts = [self.mini_path_line, self.mini_gps_scatter,
                 self.mini_trail_line, self.mini_robot,
                 self.mini_heading_arrow, self.mini_ekf_marker,
+                self.mini_heading_arrow_odom,
+                self.mini_heading_arrow_gps,
+                self.mini_heading_arrow_ekf,
                 self.mini_intermediate_marker, self.mini_dropout_ring,
                 self.mini_goal_circle, self.mini_goal_inner_ring,
                 self.mini_goal_marker]
@@ -5447,8 +7022,13 @@ class GPSWaypointGUI:
                 self.gps_scatter, self.belief_cloud,
                 self.belief_mean_marker,
                 self.trail_line, self.robot_body,
-                self.heading_arrow, self.ekf_marker,
-                self.ekf_heading_arrow, self.intermediate_marker,
+                self.heading_arrow, self.ekf_marker, self.odom_marker,
+                self.heading_arrow_odom, self.heading_arrow_gps,
+                self.heading_arrow_ekf_at_real,
+                self.ekf_robot_body, self.odom_robot_body,
+                *self.ekf_cov_ellipses,
+                self.ekf_heading_arrow, self.odom_heading_arrow,
+                self.intermediate_marker,
                 self.dropout_ring,
                 # Compass clock-hands rotate as the EKF refines θ.
                 self.compass_real_arrow, self.compass_est_arrow,
@@ -5700,8 +7280,31 @@ class GPSWaypointGUI:
             self._ax_bg = None
         self._resize_cid = self.fig.canvas.mpl_connect(
             "resize_event", _on_resize)
+        # Clean shutdown: when the figure closes (X button, Q/Esc,
+        # any path), stop the timer, disconnect event callbacks, and
+        # close every remaining matplotlib figure. Without this the
+        # Qt event loop can keep a ghost window around because the
+        # FigureCanvasQTAgg is still referenced by the timer.
+        def _on_close(_evt):
+            try:
+                self._timer.stop()
+            except Exception:
+                pass
+            for cid in (self._draw_cid, self._resize_cid):
+                try:
+                    self.fig.canvas.mpl_disconnect(cid)
+                except Exception:
+                    pass
+            plt.close("all")
+        self._close_cid = self.fig.canvas.mpl_connect(
+            "close_event", _on_close)
         self._timer.start()
         plt.show()
+        # Belt-and-suspenders: if plt.show returned without firing
+        # close_event (some Qt backends skip it on the very last
+        # figure), force a global close so the process can exit
+        # cleanly.
+        plt.close("all")
 
 
 # ── Setup helpers ────────────────────────────────────────────────
@@ -5946,6 +7549,8 @@ def build_agents(args, scenario, n_agents):
             goal_queue=goal_queue,
             coldstart_bias_enabled=getattr(
                 args, "coldstart_bias_enable", False),
+            coldstart_theta_seed_variance_deg=getattr(
+                args, "coldstart_theta_seed_variance_deg", 45.0),
             next_hint_enabled=(
                 True if getattr(args, "next_hint_enable", False)
                 else None)))
@@ -5962,6 +7567,8 @@ def build_agents(args, scenario, n_agents):
             goal_queue=goal_queue,
             coldstart_bias_enabled=getattr(
                 args, "coldstart_bias_enable", False),
+            coldstart_theta_seed_variance_deg=getattr(
+                args, "coldstart_theta_seed_variance_deg", 45.0),
             next_hint_enabled=(
                 True if getattr(args, "next_hint_enable", False)
                 else None))
@@ -5982,11 +7589,185 @@ def build_sim(args, seed=None):
                           spoofers=spoofers,
                           coldstart_bias_enabled=getattr(
                               args, "coldstart_bias_enable", False),
+                          coldstart_theta_seed_variance_deg=getattr(
+                              args,
+                              "coldstart_theta_seed_variance_deg",
+                              45.0),
                           next_hint_enabled=(
                               True if getattr(
                                   args, "next_hint_enable", False)
                               else None))
     return sim, obstacles, roofs, projectors
+
+
+def _bake_mp4(args, scenario, agents, out_path, fps=60,
+              frame_every=1, size=720, dot_size=1.8):
+    """Render the agent ensemble to MP4 fully headless — no Qt window.
+
+    Borrows ``scripts/bake_gif.py``'s figure setup (Agg backend, dark
+    facecolor, scattered agents + candidate-goal pixels, static scenery)
+    and pipes frames into imageio's H.264 writer instead of building a
+    PIL GIF. Called from ``main()`` when ``--bake-mp4 PATH`` is passed
+    so the launcher's Bake MP4 button never has to spin up the Qt GUI.
+
+    Frame cadence: capture every ``frame_every`` sim ticks (one tick =
+    0.1 s sim-time). ``frame_every=1`` captures every tick; at ``fps=60``
+    that's ~6× real-time playback (60 frames = 6 sim-seconds).
+    """
+    import os as _os
+    _os.environ.setdefault("MPLBACKEND", "Agg")
+    import matplotlib as _mpl
+    _mpl.use("Agg", force=True)
+    import matplotlib.pyplot as _plt
+    from matplotlib.patches import Circle, Rectangle, Polygon
+    import imageio.v2 as _imageio
+    import time as _time
+    from pathlib import Path as _Path
+
+    out_path = str(out_path)
+    _Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+
+    (cm, start, goal, true_heading, obstacles, roofs, projectors,
+     jammers, foliage, spoofers) = scenario
+
+    # ── Figure (mirrors bake_gif.py for visual parity) ──
+    dpi = 80
+    inches = size / dpi
+    fig, ax = _plt.subplots(figsize=(inches, inches), dpi=dpi,
+                             facecolor="#1a1a1a")
+    ax.set_facecolor("#0d1f12")
+    ax.set_xlim(-MAP_HALF, MAP_HALF)
+    ax.set_ylim(-MAP_HALF, MAP_HALF)
+    ax.set_aspect("equal")
+    ax.tick_params(colors="#888", labelsize=7)
+    for s in ax.spines.values():
+        s.set_edgecolor("#444")
+    ax.grid(True, color="#163020", linestyle=":", linewidth=0.4)
+    fig.subplots_adjust(left=0.06, right=0.98, top=0.93, bottom=0.06)
+
+    # Static scenery
+    for cx, cy, r in obstacles:
+        ax.add_patch(Circle((cx, cy), r, facecolor="#2a2a2a",
+                             edgecolor="#555", linewidth=0.3, zorder=2))
+    for x_min, y_min, x_max, y_max in roofs:
+        ax.add_patch(Rectangle(
+            (x_min, y_min), x_max - x_min, y_max - y_min,
+            facecolor=(0.45, 0.55, 0.95, 0.13),
+            edgecolor="#7099dd", linewidth=0.5,
+            linestyle="--", zorder=2.4))
+    for verts, _bias in projectors:
+        ax.add_patch(Polygon(list(verts), closed=True,
+                              facecolor="#3a2f1f",
+                              edgecolor="#c8a360",
+                              linewidth=0.5, zorder=2.5))
+    for cx, cy, r in foliage:
+        ax.add_patch(Circle(
+            (cx, cy), r,
+            facecolor=(0.35, 0.75, 0.35, 0.16),
+            edgecolor="#5fbb5f", linewidth=0.4,
+            linestyle=":", zorder=2.3))
+    for cx, cy, r in jammers:
+        verts = hex_vertices(cx, cy, r)
+        ax.add_patch(Polygon(verts, closed=True,
+                              facecolor=(0.85, 0.15, 0.45, 0.10),
+                              edgecolor="#ff4080", linewidth=0.5,
+                              linestyle="--", zorder=2.35))
+    for (cx, cy), (fx, fy) in spoofers:
+        ax.add_patch(Circle((cx, cy), SPOOFER_INFLUENCE_RADIUS_M,
+                             fill=False, edgecolor="#cc33ff",
+                             linestyle=":", linewidth=0.5, alpha=0.6,
+                             zorder=2.45))
+        ax.plot([cx], [cy], marker="D", markerfacecolor="#cc33ff",
+                 markeredgecolor="white", markersize=4,
+                 linestyle="None", zorder=2.6)
+
+    # Goal
+    ax.add_patch(Circle(goal, GOAL_RADIUS,
+                         facecolor=(0.2, 0.9, 0.3, 0.18),
+                         edgecolor="#33ff66", linewidth=0.8, zorder=3))
+    ax.plot([goal[0]], [goal[1]], "*", color="#33ff66",
+             markersize=12, markeredgecolor="white",
+             markeredgewidth=0.4, zorder=11)
+
+    # Agent + candidate scatters
+    xy  = np.empty((len(agents), 2), dtype=float)
+    cxy = np.empty((len(agents), 2), dtype=float)
+    for i, s in enumerate(agents):
+        xy[i, 0] = s.true_pos[0]; xy[i, 1] = s.true_pos[1]
+        c = s.intermediate_goal_world()
+        cxy[i, 0] = c[0]; cxy[i, 1] = c[1]
+    agent_scatter = ax.scatter(
+        xy[:, 0], xy[:, 1], s=dot_size, c="#ff7777",
+        edgecolors="none", alpha=0.7, zorder=11)
+    cand_scatter = ax.scatter(
+        cxy[:, 0], cxy[:, 1], s=0.6, c="#ffffff",
+        edgecolors="none", alpha=0.55, zorder=10.5)
+    mode_label = ("crazy" if args.crazy else
+                  ("real" if args.real else
+                   ("random" if args.random else "scripted")))
+    title_text = ax.set_title(
+        f"--{mode_label} --agents {len(agents)}  t=0.0s  arrived=0",
+        color="#e0e0e0", fontsize=10)
+
+    # ── Writer ──
+    # Probe one canvas draw to lock in even dimensions for libx264.
+    fig.canvas.draw()
+    probe = np.asarray(fig.canvas.renderer.buffer_rgba())[:, :, :3]
+    h, w = probe.shape[:2]
+    even_h = h - (h % 2); even_w = w - (w % 2)
+    writer = _imageio.get_writer(
+        out_path, fps=fps, codec="libx264",
+        quality=8, macro_block_size=1)
+    print(f"[bake-mp4] -> {out_path}  ({even_w}x{even_h} @ {fps} fps,"
+          f" capture every {frame_every} tick(s))")
+
+    # ── Step + capture loop ──
+    max_steps = getattr(args, "headless_steps", 1500) or 1500
+    t0 = _time.perf_counter()
+    last_progress = t0
+    captured = 0
+    try:
+        for step in range(max_steps):
+            any_running = False
+            for s in agents:
+                if s.step():
+                    any_running = True
+            if step % frame_every == 0:
+                for i, s in enumerate(agents):
+                    xy[i, 0] = s.true_pos[0]; xy[i, 1] = s.true_pos[1]
+                    c = s.intermediate_goal_world()
+                    cxy[i, 0] = c[0]; cxy[i, 1] = c[1]
+                agent_scatter.set_offsets(xy)
+                cand_scatter.set_offsets(cxy)
+                arrived = sum(1 for s in agents if s.arrived)
+                title_text.set_text(
+                    f"--{mode_label} --agents {len(agents)}  "
+                    f"t={step*0.1:5.1f}s  arrived={arrived}/{len(agents)}")
+                fig.canvas.draw()
+                frame = np.asarray(
+                    fig.canvas.renderer.buffer_rgba())[:even_h, :even_w, :3]
+                writer.append_data(frame)
+                captured += 1
+            now = _time.perf_counter()
+            if now - last_progress > 5.0:
+                arrived = sum(1 for s in agents if s.arrived)
+                print(f"[bake-mp4]   step {step:5d}  t={step*0.1:5.1f}s  "
+                      f"arrived={arrived}/{len(agents)}  "
+                      f"frames={captured}  wall={now-t0:.1f}s",
+                      flush=True)
+                last_progress = now
+            # Stop early if every agent is idle (matches bake_gif.py).
+            if not any_running and step > 50:
+                print(f"[bake-mp4] all agents idle at step {step}; "
+                      f"stopping.")
+                break
+    finally:
+        writer.close()
+        _plt.close(fig)
+    wall = _time.perf_counter() - t0
+    print(f"[bake-mp4] Done: {captured} frames "
+          f"({captured/max(1,fps):.1f}s video) in {wall:.1f}s wall "
+          f"-> {out_path}")
 
 
 def _apply_crazy_overrides():
@@ -6068,6 +7849,15 @@ def _apply_real_overrides():
 
 
 def main(argv=None):
+    # Hoist every module-global that any branch below may reassign.
+    # Python requires `global` declarations before the first assignment,
+    # and several toggles (--no-ekf, --no-preslam, …) overlap on the
+    # same names (e.g. LIDAR_IMU_FUSION_ENABLE).
+    global GPS_HEADING_EKF_ENABLE, LIDAR_IMU_FUSION_ENABLE
+    global ODOM_YAW_BIAS_ENABLE
+    global GPS_RECEIVER_ENABLE, NAV2_PLANNING_ENABLE
+    global GPS_LEVER_ARM_CORRECTION_ENABLE
+    global GPS_FALLBACK_ENABLE
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed (default 42).")
@@ -6143,17 +7933,23 @@ def main(argv=None):
         "--coldstart-bias-enable",
         action="store_true",
         help="Mirrors deployed ROS parameter "
-             "``coldstart_bias_enabled`` (default False on the robot, "
-             "see gps_handler_node.py L481). When set, fires the "
+             "``coldstart_bias_enabled`` (default False in code; the "
+             "deployed run-gps.sh flips it to True on "
+             "improve/gps-waypoint-continuity). When set, fires the "
              "one-shot θ_offset snap from "
-             "_seed_coldstart_theta_if_needed on the very first leg "
-             "only (deployed L1179). The sim flag is currently a "
-             "wired stub on the agent (see "
-             "``GPSWaypointSim._coldstart_bias_enabled``) — flipping "
-             "it on does NOT yet snap θ because the sim has no "
-             "non-K_est seed path; left as a TODO so the launcher "
-             "can toggle the field-parity behavior the moment the "
-             "seed helper is implemented.")
+             "``_seed_coldstart_theta_if_needed`` on the very first "
+             "GPS goal accepted by the agent. Identical to deployed "
+             "gps_handler_node.py L1179-1228.")
+    parser.add_argument(
+        "--coldstart-theta-seed-variance-deg",
+        type=float, default=45.0,
+        metavar="DEG",
+        help="Mirrors deployed ROS parameter "
+             "``coldstart_theta_seed_variance_deg`` (default 45° in "
+             "run-gps.sh on improve/gps-waypoint-continuity). "
+             "Variance applied to the one-shot θ snap. Loose by "
+             "design — bootstrap_theta's first closed-form fit "
+             "(baseline > 1.5 m) dominates this seed immediately.")
     parser.add_argument(
         "--next-hint-enable",
         action="store_true",
@@ -6187,7 +7983,109 @@ def main(argv=None):
                              "signature and 40 m miss observed on May "
                              "9th. Encoder yaw bias stays on so the "
                              "drift is visible.")
+    # ── Per-subsystem launch-stack toggles ──
+    # Granular knobs that let you simulate individual nodes failing to
+    # start. Each turns off one subsystem in isolation; you can combine
+    # them to recreate compound failures (e.g. --no-preslam
+    # --no-lever-arm = neither IMU fusion nor URDF antenna correction).
+    parser.add_argument("--no-preslam", action="store_true",
+                        help="Stack toggle: PRESLAM / LIDAR-IMU fusion "
+                             "off. Equivalent to "
+                             "LIDAR_IMU_FUSION_ENABLE = False — "
+                             "gps_handler receives raw encoder-biased "
+                             "odom (no IMU yaw cancellation). Encoder "
+                             "yaw bias also re-enabled to make the "
+                             "drift visible. Note: the SICK lidar "
+                             "supplies the IMU on this robot, so a "
+                             "LIDAR-driver outage looks identical to "
+                             "this — they're physically inseparable.")
+    parser.add_argument("--no-gps", action="store_true",
+                        help="Stack toggle: GPS receiver off. The "
+                             "/gps_fix publisher never comes up — no "
+                             "samples reach the EKF, agent runs dead-"
+                             "reckoning only. Useful for testing how "
+                             "long the controller stays usable with no "
+                             "world-frame correction.")
+    parser.add_argument("--no-gps-ekf", action="store_true",
+                        help="Stack toggle: gps_handler θ-EKF off "
+                             "(GPS_HEADING_EKF_ENABLE = False). GPS "
+                             "fixes still arrive, but no 3-state "
+                             "(x_world, y_world, θ) fusion runs — the "
+                             "heading-offset estimate stays at its "
+                             "init value.")
+    parser.add_argument("--no-gps-fallback", action="store_true",
+                        help="Disable the last-resort GPS-anchored "
+                             "candidate fallback "
+                             "(GPS_FALLBACK_ENABLE = False). Without "
+                             "this fallback, a mid-mission EKF "
+                             "degradation guarantees the real robot "
+                             "misses the goal by the virtual↔real "
+                             "translation drift. Use to measure how "
+                             "much the fallback recovers vs. doing "
+                             "nothing.")
+    parser.add_argument("--no-lever-arm", action="store_true",
+                        help="Stack toggle: antenna lever-arm "
+                             "correction off "
+                             "(GPS_LEVER_ARM_CORRECTION_ENABLE = "
+                             "False). On the real robot this is "
+                             "wired to the URDF static transform "
+                             "antenna→base_link published by "
+                             "``robot_state_publisher`` — NOT "
+                             "``slam_toolbox``. Reproduces what "
+                             "happens if robot_state_publisher fails "
+                             "or the URDF antenna_link is missing: "
+                             "the antenna offset isn't subtracted in "
+                             "the gps_callback, so a heading-locked "
+                             "systematic bias appears in every fix "
+                             "and the EKF locks onto it.")
+    parser.add_argument("--no-nav2", action="store_true",
+                        help="Stack toggle: NAV2 path planning off "
+                             "(NAV2_PLANNING_ENABLE = False). No A* "
+                             "replans — the agent uses its initial "
+                             "plan if one exists, otherwise the "
+                             "controller falls back to bee-lining the "
+                             "candidate goal.")
+    parser.add_argument("--gps-bias", type=float, default=None,
+                        metavar="METERS",
+                        help="Give each agent a fixed installation-"
+                             "offset on its GPS readings. The magnitude "
+                             "is drawn uniformly from [0, METERS] per "
+                             "agent at init; the direction is uniform "
+                             "on [0, 2π). Persistent — added to every "
+                             "fix for the agent's whole session. Models "
+                             "antenna-placement / receiver-clock / "
+                             "site-multipath errors that the 3-state "
+                             "EKF cannot observe out (the bias looks "
+                             "identical to a shifted world frame). "
+                             "Default unset = 0 m (back-compat).")
+    parser.add_argument("--bake-mp4", type=str, default=None,
+                        metavar="PATH",
+                        help="Render the sim to a fully headless MP4 "
+                             "at PATH instead of launching the Qt GUI. "
+                             "No window appears — the agent ensemble "
+                             "is built, stepped, and rasterised to an "
+                             "H.264 file via imageio. Works with all "
+                             "scenario flags (--real, --crazy, "
+                             "--agents N, --gps-bias, etc.).")
+    parser.add_argument("--bake-fps", type=int, default=60,
+                        help="Playback fps for --bake-mp4 (default 60).")
+    parser.add_argument("--bake-frame-every", type=int, default=1,
+                        metavar="N",
+                        help="Capture a frame every N sim ticks for "
+                             "--bake-mp4 (default 1 = every tick). "
+                             "Higher = faster playback / fewer frames.")
+    parser.add_argument("--bake-steps", type=int, default=1500,
+                        metavar="N",
+                        help="Maximum sim ticks to simulate for "
+                             "--bake-mp4 (default 1500 = 150 s of sim "
+                             "time). Loop exits early if every agent "
+                             "goes idle.")
     args = parser.parse_args(argv)
+    # Apply --gps-bias if provided. Modifying the module global is the
+    # same pattern --real / --crazy use for other GPS knobs.
+    if args.gps_bias is not None and args.gps_bias > 0.0:
+        global GPS_MEAN_BIAS_M
+        GPS_MEAN_BIAS_M = float(args.gps_bias)
 
     if args.crazy:
         args.random = True
@@ -6218,11 +8116,32 @@ def main(argv=None):
         # entirely (ekf.theta forced to 0 every update), so the
         # agent treats world-frame goals as if they were already
         # in odom — the deployed robot's pre-fix behavior.
-        global GPS_HEADING_EKF_ENABLE, LIDAR_IMU_FUSION_ENABLE
-        global ODOM_YAW_BIAS_ENABLE
         GPS_HEADING_EKF_ENABLE = False
         LIDAR_IMU_FUSION_ENABLE = False
         ODOM_YAW_BIAS_ENABLE = True
+    # ── Per-subsystem stack toggles (apply in addition to --no-ekf) ──
+    if args.no_preslam:
+        LIDAR_IMU_FUSION_ENABLE = False
+        # Re-enable the encoder yaw bias so the lost-fusion effect is
+        # visible at the gps_handler stage.
+        ODOM_YAW_BIAS_ENABLE = True
+    if args.no_gps:
+        GPS_RECEIVER_ENABLE = False
+    if args.no_gps_ekf:
+        GPS_HEADING_EKF_ENABLE = False
+        # NOTE: We deliberately do NOT touch LIDAR_IMU_FUSION_ENABLE
+        # or ODOM_YAW_BIAS_ENABLE here. Both the EKF and ODOM virtual
+        # robots run in parallel at all times — the only thing this
+        # toggle changes is which one the planner uses as its anchor
+        # (see ``_plan_anchor_xy``). The EKF virtual robot keeps
+        # tracking the real robot in the background even when the
+        # planner has switched to ODOM.
+    if args.no_gps_fallback:
+        GPS_FALLBACK_ENABLE = False
+    if args.no_lever_arm:
+        GPS_LEVER_ARM_CORRECTION_ENABLE = False
+    if args.no_nav2:
+        NAV2_PLANNING_ENABLE = False
     if args.single:
         args.agents = 1
 
@@ -6232,6 +8151,19 @@ def main(argv=None):
     agents = build_agents(args, scenario, max(1, args.agents))
     sim = agents[0]
     peers = agents[1:]
+
+    # ── Bake-MP4 branch (fully headless, no Qt) ──
+    # Takes precedence over --headless and the live GUI. Uses the same
+    # scenario + agents already built above; reuses headless_steps as
+    # the cap when --bake-steps wasn't overridden.
+    if args.bake_mp4:
+        # Re-use --bake-steps as the upper bound on sim ticks.
+        bake_args = args
+        bake_args.headless_steps = args.bake_steps
+        _bake_mp4(bake_args, scenario, agents, args.bake_mp4,
+                  fps=args.bake_fps,
+                  frame_every=max(1, args.bake_frame_every))
+        return 0
 
     if args.headless:
         import time as _time
@@ -6301,7 +8233,67 @@ def main(argv=None):
                 f" mission_leg={sim.leg_index}/{sim.leg_count}"
                 f" mission_remaining={len(sim.goal_queue)}"
             )
-        print(f"t={sim.sim_time:.2f}s steps={sim.steps} agents={len(agents)} "
+        # 4-heading watchdog stats (DESIGN_INTENT.md).
+        # ``inv_err`` is the most recent sim-tick value (signed deg);
+        # ``inv_max`` is the largest |err| seen over the run;
+        # ``inv_fire`` is the number of times the watchdog forced a
+        # heading resync. NaN-safe formatting: NaN → ``--`` so a run
+        # that never accumulated enough baseline doesn't print
+        # garbage.
+        inv_latest_rad = getattr(sim, "_inv_err_latest", float("nan"))
+        inv_max_rad = getattr(sim, "_inv_err_max_abs", 0.0)
+        inv_fires = getattr(sim, "_inv_err_fired_count", 0)
+        inv_latest_str = (f"{math.degrees(inv_latest_rad):+.2f}°"
+                          if inv_latest_rad == inv_latest_rad else "--")
+        # Ensemble BODY-heading-in-world error vs the EKF's belief.
+        # This is the metric that actually drives orbiting: if the
+        # EKF thinks the body is pointing in direction X but the
+        # body is really pointing in direction X+Δ, every commanded
+        # forward motion will be off by Δ — and the robot orbits
+        # at a radius proportional to Δ × goal_distance.
+        #
+        # Sim-only measurement (the deployed robot cannot observe
+        # this directly; the closest deployable proxy is course-
+        # over-ground from GPS vs body_heading + ekf.theta).
+        #
+        #   true_world_heading = body_heading_true + true_heading
+        #   ekf_world_heading  = body_heading + heading_offset_est
+        #                       (= IMU-fused body heading + ekf.theta)
+        head_errs_deg = []
+        for s in agents:
+            h_true = s.body_heading_true + s.true_heading
+            h_est = s.body_heading + s.heading_offset_est
+            d = ((h_true - h_est + math.pi)
+                  % (2 * math.pi) - math.pi)
+            head_errs_deg.append(math.degrees(d))
+        if head_errs_deg:
+            ens_head_mean = (sum(abs(x) for x in head_errs_deg)
+                              / len(head_errs_deg))
+            ens_head_max = max(abs(x) for x in head_errs_deg)
+        else:
+            ens_head_mean = 0.0
+            ens_head_max = 0.0
+        # Arrival validators (local + GPS + Mahalanobis χ²).
+        # ``mahalan`` < 5.99 means the goal is inside the EKF's 95%
+        # confidence ellipse — required for arrival to declare.
+        arr = sim._arrival_validators()
+        arr_local = arr["local_d"]
+        arr_gps = arr["gps_d"]
+        arr_mahalan = arr["mahalan"]
+        def _fmt_metric(v, fmt="{:.2f}"):
+            return ("inf" if v == float("inf") else fmt.format(v))
+        # Algorithm-mode tag: shows which planner-anchor the algorithm
+        # is currently using. EKF Stable = ekf.pos_xy (normal);
+        # EKF Degraded = GPS-fallback engaged (latest_gps anchor);
+        # ODOM-Only = EKF off AND fallback disabled (unrecoverable).
+        if getattr(sim, "_gps_fallback_engaged", False):
+            algo_tag = "[EKF Degraded Algorithm]"
+        elif GPS_HEADING_EKF_ENABLE and sim.ekf is not None:
+            algo_tag = "[EKF Stable Algorithm]"
+        else:
+            algo_tag = "[ODOM-Only Algorithm]"
+        print(f"{algo_tag} "
+              f"t={sim.sim_time:.2f}s steps={sim.steps} agents={len(agents)} "
               f"arrived={n_arrived}/{len(agents)} "
               f"pred_ok={n_pred_ok} pred_fail={n_pred_fail} "
               f"unclassified={n_unclassified} "
@@ -6311,9 +8303,23 @@ def main(argv=None):
               f"per_step={1000*wall/max(1,sim.steps):.2f}ms "
               f"primary_dist={true_dist:.2f}m "
               f"heading_err={heading_err:+.2f}° "
+              f"ens|θ_err|mean={ens_head_mean:.2f}° "
+              f"ens|θ_err|max={ens_head_max:.2f}° "
+              f"|θ_err|max_over_run={getattr(sim, '_body_theta_err_max_abs_deg', 0.0):.2f}° "
               f"ekf_σθ={ekf_tstd:.2f}° "
               f"ekf_upd/rej={ekf_upd}/{ekf_rej} "
               f"cloud_mean_dist={mean_dist:.2f}m "
+              f"inv_err={inv_latest_str} "
+              f"inv_max={math.degrees(inv_max_rad):.1f}° "
+              f"inv_fire={inv_fires} "
+              f"inv_ratio={_fmt_metric(getattr(sim, '_inv_ratio_latest', float('nan')), '{:.2f}')} "
+              f"ratio_fire={getattr(sim, '_inv_ratio_fired_count', 0)} "
+              f"goal_ratio={_fmt_metric(getattr(sim, '_inv_goal_dist_ratio_latest', float('nan')), '{:.2f}')} "
+              f"goal_fire={getattr(sim, '_inv_goal_dist_fired_count', 0)} "
+              f"fallback={'ON' if getattr(sim, '_gps_fallback_engaged', False) else 'off'} "
+              f"arr_local={_fmt_metric(arr_local)}m "
+              f"arr_gps={_fmt_metric(arr_gps)}m "
+              f"arr_χ²={_fmt_metric(arr_mahalan, '{:.2f}')} "
               f"pad={sim.last_pad}"
               + mission_suffix)
         return 0
