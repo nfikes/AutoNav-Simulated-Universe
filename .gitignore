@@ -40,9 +40,13 @@ tile_cache/
 # saves a 16-bit ``*.terrain.png`` / ``*.test_terrain.png`` next to
 # it as a precomputed elevation/shading cache; subsequent runs load
 # instantly. Regenerated on demand whenever the cache is missing
-# or older than the STL, so it never needs to live in git.
+# or older than the STL. The default-STL cache
+# (``Lidar_Surface_fast.terrain.png``, ~386 KB) is checked in so a
+# fresh clone doesn't have to pay the one-time bake cost; all other
+# variants stay out of git.
 **/3d_assets/*.terrain.png
 **/3d_assets/*.test_terrain.png
+!LiDAR Sim/3d_assets/Lidar_Surface_fast.terrain.png
 
 # ROS bag recordings. The GUI sim's recording mode dumps a
 # ``manual_<timestamp>/`` directory per session containing a 280+ MB
