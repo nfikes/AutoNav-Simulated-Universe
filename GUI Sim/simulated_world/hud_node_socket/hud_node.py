@@ -2199,13 +2199,13 @@ class HudWindow(QMainWindow):
         lbl_git.setStyleSheet(group_label_style)
         dev_layout.addWidget(lbl_git)
 
-        self._dev_pull_btn = QPushButton("git pull")
+        self._dev_pull_btn = QPushButton("git sync (hard)")
         self._dev_pull_btn.setStyleSheet(dev_btn_compact)
         self._dev_pull_btn.setFocusPolicy(Qt.NoFocus)
         self._dev_pull_btn.clicked.connect(self._dev_git_pull)
         dev_layout.addWidget(self._dev_pull_btn)
         self._dev_nav_buttons.append(
-            (self._dev_pull_btn, "git pull", dev_btn_compact)
+            (self._dev_pull_btn, "git sync (hard)", dev_btn_compact)
         )
 
         # Branch switching is on its own sub-page (one click deeper) so
@@ -2293,12 +2293,12 @@ class HudWindow(QMainWindow):
         self._dev_branch_grid.setSpacing(4)
         branch_holder = QWidget()
         branch_holder.setLayout(self._dev_branch_grid)
-        branch_scroll = QScrollArea()
-        branch_scroll.setWidgetResizable(True)
-        branch_scroll.setWidget(branch_holder)
-        branch_scroll.setStyleSheet("QScrollArea { border: none; }")
-        branch_scroll.setMinimumHeight(280)
-        branches_layout.addWidget(branch_scroll, stretch=1)
+        self._branch_scroll = QScrollArea()
+        self._branch_scroll.setWidgetResizable(True)
+        self._branch_scroll.setWidget(branch_holder)
+        self._branch_scroll.setStyleSheet("QScrollArea { border: none; }")
+        self._branch_scroll.setMinimumHeight(280)
+        branches_layout.addWidget(self._branch_scroll, stretch=1)
 
         # Back to Developer
         exit_branches_style = (
@@ -3876,9 +3876,9 @@ class HudWindow(QMainWindow):
     def _move_gps_goal(self, d_north_m, d_east_m):
         """Nudge the GPS-goal crosshair by (north, east) meters and
         refresh the readout. Uses a WGS84 small-step approximation.
-        If the new position falls outside the current GPS viewport,
-        expand the limits immediately so the crosshair stays visible
-        without waiting for the next live tick."""
+        Viewport is re-derived as a uniform square (in meters) around
+        the robot — extending only one axis stretches the satellite
+        tile because 1° of lon ≠ 1° of lat at this latitude."""
         dlat = d_north_m / 111320.0
         dlon = d_east_m / (
             111320.0 * max(0.1, math.cos(math.radians(self._gps_goal_lat)))
@@ -3889,25 +3889,29 @@ class HudWindow(QMainWindow):
         self._gps_goal_readout.set_text(
             f"{self._gps_goal_lat:.6f}, {self._gps_goal_lon:.6f}"
         )
-        # Auto-pan/zoom so the crosshair is never off-screen between
-        # arrow presses. Margin sized for visible breathing room — the
-        # crosshair should clearly sit *inside* the viewport, not on
-        # the edge.
-        x0, x1 = self._gps_ax.get_xlim()
-        y0, y1 = self._gps_ax.get_ylim()
-        margin_m = 5.0
-        margin_lat = margin_m / 111320.0
-        margin_lon = margin_m / (
-            111320.0 * max(0.1, math.cos(math.radians(self._gps_goal_lat)))
-        )
-        gx, gy = self._gps_goal_lon, self._gps_goal_lat
-        new_x0 = min(x0, gx - margin_lon)
-        new_x1 = max(x1, gx + margin_lon)
-        new_y0 = min(y0, gy - margin_lat)
-        new_y1 = max(y1, gy + margin_lat)
-        if (new_x0, new_x1, new_y0, new_y1) != (x0, x1, y0, y1):
-            self._gps_ax.set_xlim(new_x0, new_x1)
-            self._gps_ax.set_ylim(new_y0, new_y1)
+        # Recompute the GPS viewport: square radius in meters, centered
+        # on the robot, sized to include the crosshair plus a 5 m
+        # breathing-room buffer. Identical math to the live-tick
+        # redraw so the view doesn't snap when the next tick fires.
+        lats = self._gps_buf.get('lat')
+        lons = self._gps_buf.get('lon')
+        if lats and lons:
+            cur_lat = float(lats[-1])
+            cur_lon = float(lons[-1])
+            dnorth_m = (self._gps_goal_lat - cur_lat) * 111320.0
+            deast_m = (
+                (self._gps_goal_lon - cur_lon)
+                * 111320.0
+                * max(0.1, math.cos(math.radians(cur_lat)))
+            )
+            needed = max(abs(dnorth_m), abs(deast_m)) + 5.0
+            view_radius_m = max(_GPS_VIEW_RADIUS_M, needed)
+            view_dlat = view_radius_m / 111320.0
+            view_dlon = view_radius_m / (
+                111320.0 * max(0.1, math.cos(math.radians(cur_lat)))
+            )
+            self._gps_ax.set_xlim(cur_lon - view_dlon, cur_lon + view_dlon)
+            self._gps_ax.set_ylim(cur_lat - view_dlat, cur_lat + view_dlat)
         self._gps_canvas.draw_idle()
 
     def _run_one_shot_script(self, label, script, args):
@@ -4120,16 +4124,50 @@ class HudWindow(QMainWindow):
                 return True
         return False
 
+    def _dev_git_hard_sync(self, log=None):
+        """Force the host repo to match origin/<current-branch>.
+
+        Sequence: fetch → reset --hard origin/<branch> → clean -fd →
+        submodule update --init --recursive. Untracked files in the
+        working tree are deleted; gitignored build artifacts are kept.
+
+        Returns (ok: bool, summary: str). When `log` is provided, every
+        sub-step's stdout/stderr is passed to it.
+        """
+        def _emit(msg):
+            if log is not None and msg:
+                log(msg)
+
+        rc_b, branch, err_b = self._dev_run_git(
+            ['branch', '--show-current'])
+        if rc_b != 0 or not branch:
+            return False, f"branch lookup failed: {err_b or 'detached HEAD'}"
+
+        for step_args, step_timeout in (
+            (['fetch', 'origin', '--prune'], 60),
+            (['reset', '--hard', f'origin/{branch}'], 30),
+            (['clean', '-fd'], 30),
+            (['submodule', 'update', '--init', '--recursive'], 120),
+        ):
+            _emit(f"$ git {' '.join(step_args)}")
+            rc, out, err = self._dev_run_git(step_args, timeout=step_timeout)
+            _emit(out)
+            _emit(err)
+            if rc != 0:
+                msg = (err or out or 'unknown').splitlines()[-1]
+                return False, f"git {step_args[0]} failed: {msg}"
+
+        return True, f"synced to origin/{branch}"
+
     def _dev_git_pull(self):
-        self._dev_set_status("Running git pull --ff-only…", color='#ff0')
+        self._dev_set_status(
+            "Hard-syncing to origin/<branch>…", color='#ff0')
         QApplication.processEvents()
-        rc, out, err = self._dev_run_git(['pull', '--ff-only'], timeout=60)
-        if rc == 0:
-            summary = out.splitlines()[-1] if out else 'Up to date'
-            self._dev_set_status(f"Pull OK: {summary}", color='#0f0')
+        ok, summary = self._dev_git_hard_sync()
+        if ok:
+            self._dev_set_status(f"Sync OK: {summary}", color='#0f0')
         else:
-            msg = (err or out or 'unknown error').splitlines()[-1]
-            self._dev_set_status(f"Pull failed: {msg}", color='#f44')
+            self._dev_set_status(f"Sync failed: {summary}", color='#f44')
         self._dev_update_branch_label()
         self._dev_refresh_branches()
 
@@ -4584,19 +4622,16 @@ class HudWindow(QMainWindow):
                 # start step below will surface real issues.
                 log(f"[stop] {e}")
 
-            # 2. git pull --ff-only on the host repo.
+            # 2. Hard-sync host repo to origin/<branch> — discards any
+            #    local edits and untracked files so the Jetson tree
+            #    always matches origin.
             self._dev_ui_status(
-                "[2/5] git pull --ff-only…", color='#ff0')
-            log("$ git pull --ff-only")
-            rc, out, err = self._dev_run_git(
-                ['pull', '--ff-only'], timeout=120)
-            log(out)
-            log(err)
-            if rc != 0:
-                msg = (err or out or 'unknown').splitlines()[-1]
+                "[2/5] git hard-sync to origin…", color='#ff0')
+            ok, summary = self._dev_git_hard_sync(log=log)
+            if not ok:
                 self._dev_ui_status(
-                    f"Pull failed: {msg}", color='#f44')
-                log(f"[!] Pull failed: {msg}")
+                    f"Sync failed: {summary}", color='#f44')
+                log(f"[!] Sync failed: {summary}")
                 return
 
             # 3. Start container detached.
@@ -5291,18 +5326,19 @@ class HudWindow(QMainWindow):
         if self._launch_queue:
             q_str = " > ".join(self._launch_queue)
             parts.append(f"Queued: {q_str}")
+        T = self._translate_to_theme
         if parts:
             self._queue_label.setText(" | ".join(parts))
-            self._queue_label.setStyleSheet(
+            self._queue_label.setStyleSheet(T(
                 "border: none; color: #ff0; font-size: 10px;"
                 " font-family: monospace;"
-            )
+            ))
         else:
             self._queue_label.setText("Queue: idle")
-            self._queue_label.setStyleSheet(
+            self._queue_label.setStyleSheet(T(
                 "border: none; color: #888; font-size: 10px;"
                 " font-family: monospace;"
-            )
+            ))
 
     def _toggle_device(self, label):
         """Toggle a device on/off. Uses a queue so only one starts at a time."""
@@ -5363,7 +5399,7 @@ class HudWindow(QMainWindow):
                 for i, (btn, blabel, _s) in enumerate(self._launch_nav_buttons):
                     if blabel == label:
                         btn.setText("Waiting")
-                        btn.setStyleSheet(self._launch_wait_style)
+                        btn.setStyleSheet(self._translate_to_theme(self._launch_wait_style))
                         self._launch_nav_buttons[i] = (btn, blabel, self._launch_wait_style)
                         break
                 self._update_selection()
@@ -6668,6 +6704,33 @@ class HudWindow(QMainWindow):
                             widget.setStyleSheet(T(base_style))
         # Position floating directional indicators around the selected widget
         self._position_indicators()
+        # Auto-scroll the branches sub-page so arrow-key nav keeps the
+        # selected branch visible. The list often overflows the 280 px
+        # min-height scroll area once a repo accumulates branches.
+        self._ensure_branch_visible()
+
+    def _ensure_branch_visible(self):
+        """If the operator is navigating the Switch Branch sub-page,
+        scroll the branch list so the currently selected widget is in
+        view. No-op on every other page."""
+        if not hasattr(self, '_branch_scroll'):
+            return
+        if not hasattr(self, '_options_stack'):
+            return
+        if self._options_stack.currentIndex() != 5:
+            return
+        if self._nav_col != 0:
+            return
+        try:
+            widget, _, _ = self._cur_btn()
+        except Exception:
+            return
+        if widget is None:
+            return
+        # ensureWidgetVisible no-ops if `widget` isn't a descendant of
+        # the scroll area's viewport — that's the desired behavior for
+        # the Refresh / Back nav rows that live outside the scroller.
+        self._branch_scroll.ensureWidgetVisible(widget, 0, 40)
 
     def _position_indicators(self):
         """Show << and >> around the slider knob only when in scrub mode."""
@@ -7737,29 +7800,31 @@ class HudWindow(QMainWindow):
             self._gps_trail.set_data(lons, lats)
             # Current position dot
             self._gps_dot.set_data([lons[-1]], [lats[-1]])
-            # 100 ft window centered on current position
             cur_lat, cur_lon = lats[-1], lons[-1]
-            dlat = _GPS_VIEW_RADIUS_M / 111320.0
-            dlon = _GPS_VIEW_RADIUS_M / (111320.0 * math.cos(math.radians(cur_lat)))
-            x0, x1 = cur_lon - dlon, cur_lon + dlon
-            y0, y1 = cur_lat - dlat, cur_lat + dlat
-            # If the operator is placing a GPS goal and has arrowed past
-            # the default 100 ft window, extend the view to include the
-            # crosshair plus a 5 m breathing-room buffer so it doesn't
-            # sit on the edge. The next redraw after _exit_gps_goal_mode
-            # skips this branch, so the view snaps back on send/cancel.
+            # View is a square in meters centered on the robot. Default
+            # radius is 100 ft; while the operator is placing a GPS
+            # goal, the radius grows uniformly to include the crosshair
+            # plus a 5 m buffer. Scaling stays proportional in both
+            # axes so the satellite tile never gets squished — without
+            # this, extending lon-only or lat-only stretches the image
+            # because 1° of lon is shorter than 1° of lat at this
+            # latitude.
+            view_radius_m = _GPS_VIEW_RADIUS_M
             if self._gps_goal_mode:
-                buf_m = 5.0
-                buf_lat = buf_m / 111320.0
-                buf_lon = buf_m / (
-                    111320.0 * max(0.1, math.cos(math.radians(self._gps_goal_lat)))
+                dnorth_m = (self._gps_goal_lat - cur_lat) * 111320.0
+                deast_m = (
+                    (self._gps_goal_lon - cur_lon)
+                    * 111320.0
+                    * max(0.1, math.cos(math.radians(cur_lat)))
                 )
-                x0 = min(x0, self._gps_goal_lon - buf_lon)
-                x1 = max(x1, self._gps_goal_lon + buf_lon)
-                y0 = min(y0, self._gps_goal_lat - buf_lat)
-                y1 = max(y1, self._gps_goal_lat + buf_lat)
-            self._gps_ax.set_xlim(x0, x1)
-            self._gps_ax.set_ylim(y0, y1)
+                needed = max(abs(dnorth_m), abs(deast_m)) + 5.0
+                view_radius_m = max(view_radius_m, needed)
+            dlat = view_radius_m / 111320.0
+            dlon = view_radius_m / (
+                111320.0 * max(0.1, math.cos(math.radians(cur_lat)))
+            )
+            self._gps_ax.set_xlim(cur_lon - dlon, cur_lon + dlon)
+            self._gps_ax.set_ylim(cur_lat - dlat, cur_lat + dlat)
             # Show lat/lon truncated to 4 decimals
             self._gps_coord_label.set_text(
                 f"Lat: {cur_lat:.4f}\nLon: {cur_lon:.4f}"
