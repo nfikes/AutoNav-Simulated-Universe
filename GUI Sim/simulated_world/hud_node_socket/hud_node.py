@@ -1117,7 +1117,7 @@ class HudWindow(QMainWindow):
         '#ffffff': '#000000',  # title text (full 6-char form)
         '#0f0':    '#0a8800',  # active green text
         '#0af':    '#0a5a9a',  # info blue
-        '#ff0':    '#a06000',  # yellow text status (dots use #ffff00 below)
+        '#ff0':    '#cc5500',  # yellow text status (dots use #ffff00 below)
         '#f44':    '#cc3030',  # red dot
         '#4f4':    '#0db000',  # green dot — distinct from #0f0 so reverse map is bijective
         '#111111': '#f5f5f5',  # mpl axes facecolor
@@ -1849,102 +1849,46 @@ class HudWindow(QMainWindow):
         )
 
         # --- One-shot script runners: send_goal.sh / send_GPS_waypoint.sh ---
-        # Each row is [label | QLineEdit args | Send button]. The button
-        # fires the script (wrapped for the container) with the args
-        # string appended; output is captured into _process_buffers
-        # under the label so it shows up in the terminal display when
-        # the device dot is selected (no dot is wired for these, so the
-        # operator selects via the existing dot UI — output is mostly
-        # informational anyway).
+        # Each is a single button that hands the operator into a temporary
+        # "goal pick" mode. In that mode arrow keys move a crosshair on
+        # the corresponding data-column plot (ODOM for local, GPS map for
+        # GPS); Enter fires the script with the picked coordinates and
+        # Esc cancels. See _enter_local_goal_mode / _enter_gps_goal_mode
+        # and the goal-mode branch in keyPressEvent.
         sep_send = QFrame()
         sep_send.setFrameShape(QFrame.HLine)
         sep_send.setStyleSheet("background-color: #444; border: none; max-height: 1px;")
         sep_send.setFixedHeight(1)
         launch_layout.addWidget(sep_send)
 
-        send_field_style = (
-            "QLineEdit {"
-            "  background-color: #1a1a1a; color: #dcdcdc;"
-            "  border: 1px solid #555; border-radius: 3px;"
-            "  padding: 4px 6px; font-size: 11px; font-family: monospace;"
-            "}"
-            "QLineEdit:focus { border: 1px solid #0af; }"
-        )
         send_btn_style = (
             "QPushButton {"
             "  background-color: #2a2a2a; color: #0af;"
             "  border: 1px solid #0af; border-radius: 4px;"
-            "  padding: 6px 8px; font-size: 11px;"
+            "  padding: 8px 8px; font-size: 11px;"
             "}"
             "QPushButton:hover { background-color: #3a3a3a; }"
             "QPushButton:pressed { background-color: #1a1a1a; }"
         )
-
-        # Selected-state style for the input fields: green border so
-        # the operator can see which row arrow-nav is on. Stored on
-        # self because _update_selection reads it.
-        self._send_field_base_style = send_field_style
-        self._send_field_sel_style = (
-            "QLineEdit {"
-            "  background-color: #1a2a1a; color: #dcdcdc;"
-            "  border: 2px solid #0f0; border-radius: 3px;"
-            "  padding: 3px 5px; font-size: 11px; font-family: monospace;"
-            "}"
-        )
         self._send_btn_base_style = send_btn_style
 
-        send_grid = QGridLayout()
-        send_grid.setSpacing(4)
-
-        lbl_goal = QLabel("Send Goal")
-        lbl_goal.setStyleSheet("border: none; color: #dcdcdc; font-size: 11px;")
-        self._send_goal_input = QLineEdit()
-        self._send_goal_input.setStyleSheet(send_field_style)
-        btn_send_goal = QPushButton("Send")
-        btn_send_goal.setStyleSheet(send_btn_style)
-        btn_send_goal.setFocusPolicy(Qt.NoFocus)
-        btn_send_goal.setFixedWidth(60)
-        btn_send_goal.clicked.connect(self._on_send_goal_clicked)
-        self._send_goal_input.returnPressed.connect(self._on_send_goal_clicked)
-        send_grid.addWidget(lbl_goal, 0, 0)
-        send_grid.addWidget(self._send_goal_input, 0, 1)
-        send_grid.addWidget(btn_send_goal, 0, 2)
-        # Arrow-key nav participation. Up/Down through these in col 0
-        # of the launch-page nav grid. Enter on the QLineEdit focuses
-        # it (for typing); Enter on the button submits. See
-        # _update_selection / keyPressEvent for the QLineEdit-aware
-        # paths.
+        btn_local_goal = QPushButton("Set Local Goal…")
+        btn_local_goal.setStyleSheet(send_btn_style)
+        btn_local_goal.setFocusPolicy(Qt.NoFocus)
+        btn_local_goal.clicked.connect(self._enter_local_goal_mode)
+        launch_layout.addWidget(btn_local_goal)
         self._launch_nav_buttons.append(
-            (self._send_goal_input, "Send Goal Args", send_field_style)
-        )
-        self._launch_nav_buttons.append(
-            (btn_send_goal, "Send", send_btn_style)
+            (btn_local_goal, "Set Local Goal…", send_btn_style)
         )
 
-        lbl_gps = QLabel("Send GPS")
-        lbl_gps.setStyleSheet("border: none; color: #dcdcdc; font-size: 11px;")
-        self._send_gps_input = QLineEdit()
-        self._send_gps_input.setStyleSheet(send_field_style)
-        btn_send_gps = QPushButton("Send")
-        btn_send_gps.setStyleSheet(send_btn_style)
-        btn_send_gps.setFocusPolicy(Qt.NoFocus)
-        btn_send_gps.setFixedWidth(60)
-        btn_send_gps.clicked.connect(self._on_send_gps_clicked)
-        self._send_gps_input.returnPressed.connect(self._on_send_gps_clicked)
-        send_grid.addWidget(lbl_gps, 1, 0)
-        send_grid.addWidget(self._send_gps_input, 1, 1)
-        send_grid.addWidget(btn_send_gps, 1, 2)
+        btn_gps_goal = QPushButton("Set GPS Goal…")
+        btn_gps_goal.setStyleSheet(send_btn_style)
+        btn_gps_goal.setFocusPolicy(Qt.NoFocus)
+        btn_gps_goal.clicked.connect(self._enter_gps_goal_mode)
+        launch_layout.addWidget(btn_gps_goal)
         self._launch_nav_buttons.append(
-            (self._send_gps_input, "Send GPS Args", send_field_style)
+            (btn_gps_goal, "Set GPS Goal…", send_btn_style)
         )
-        self._launch_nav_buttons.append(
-            (btn_send_gps, "Send", send_btn_style)
-        )
-
-        send_grid.setColumnStretch(0, 0)
-        send_grid.setColumnStretch(1, 1)
-        send_grid.setColumnStretch(2, 0)
-        launch_layout.addLayout(send_grid)
 
         launch_layout.addStretch()
 
@@ -2759,6 +2703,29 @@ class HudWindow(QMainWindow):
         self._gps_map_img = None          # numpy RGB array
         self._gps_trail, = self._gps_ax.plot([], [], 'c-', linewidth=1, alpha=0.6)
         self._gps_dot, = self._gps_ax.plot([], [], 'ro', markersize=5, zorder=5)
+        # Goal-pick crosshair + banner. Hidden until the operator enters
+        # GPS goal-pick mode via the launch-page "Set GPS Goal" button.
+        # See _enter_gps_goal_mode / _exit_gps_goal_mode.
+        self._gps_goal_cross, = self._gps_ax.plot(
+            [], [], marker='+', color='#0ff', markersize=18,
+            markeredgewidth=2, linestyle='none', zorder=10,
+        )
+        self._gps_goal_cross.set_visible(False)
+        self._gps_goal_banner = self._gps_ax.text(
+            0.5, 0.02,
+            'GPS GOAL PICK · ←↑↓→ move · ENTER send · ESC cancel',
+            transform=self._gps_ax.transAxes, fontsize=7, color='#0ff',
+            ha='center', va='bottom', family='monospace',
+            bbox=dict(facecolor='#111111', alpha=0.85, edgecolor='#0ff', pad=2),
+        )
+        self._gps_goal_banner.set_visible(False)
+        self._gps_goal_readout = self._gps_ax.text(
+            0.98, 0.02, '', transform=self._gps_ax.transAxes,
+            fontsize=7, color='#0ff', ha='right', va='bottom',
+            family='monospace',
+            bbox=dict(facecolor='#111111', alpha=0.85, edgecolor='none', pad=2),
+        )
+        self._gps_goal_readout.set_visible(False)
         self._gps_canvas.setMinimumSize(50, 50)
         gps_layout.addWidget(self._gps_canvas, stretch=1)
 
@@ -2803,6 +2770,29 @@ class HudWindow(QMainWindow):
             ha='center', va='center', family='monospace',
         )
         self._odom_live_txt.set_visible(False)
+        # Goal-pick crosshair + banner. Hidden until the operator enters
+        # local goal-pick mode via the launch-page "Set Local Goal" button.
+        # See _enter_local_goal_mode / _exit_local_goal_mode.
+        self._odom_goal_cross, = self._odom_ax.plot(
+            [], [], marker='+', color='#0ff', markersize=18,
+            markeredgewidth=2, linestyle='none', zorder=10,
+        )
+        self._odom_goal_cross.set_visible(False)
+        self._odom_goal_banner = self._odom_ax.text(
+            0.5, 0.02,
+            'LOCAL GOAL PICK · ←↑↓→ move · ENTER send · ESC cancel',
+            transform=self._odom_ax.transAxes, fontsize=7, color='#0ff',
+            ha='center', va='bottom', family='monospace',
+            bbox=dict(facecolor='#111111', alpha=0.85, edgecolor='#0ff', pad=2),
+        )
+        self._odom_goal_banner.set_visible(False)
+        self._odom_goal_readout = self._odom_ax.text(
+            0.98, 0.02, '', transform=self._odom_ax.transAxes,
+            fontsize=7, color='#0ff', ha='right', va='bottom',
+            family='monospace',
+            bbox=dict(facecolor='#111111', alpha=0.85, edgecolor='none', pad=2),
+        )
+        self._odom_goal_readout.set_visible(False)
         self._odom_canvas.setMinimumSize(50, 50)
         enc_layout.addWidget(self._odom_canvas, stretch=1)
 
@@ -2962,6 +2952,17 @@ class HudWindow(QMainWindow):
             "QFrame#sensorCell {"
             "  border: 2px solid #0af;"
             "  background-color: #1a2a3a;"
+            "  border-radius: 3px;"
+            "}"
+        )
+        # Goal-pick border for the ODOM / GPS cell while the operator is
+        # placing a crosshair. Cyan to match the crosshair color and
+        # thicker than the nav-selection border so it's unmistakable
+        # even when the cell also happens to be the nav-selected one.
+        self._sensor_goal_style = (
+            "QFrame#sensorCell {"
+            "  border: 3px solid #0ff;"
+            "  background-color: #1a2a2a;"
             "  border-radius: 3px;"
             "}"
         )
@@ -3223,6 +3224,16 @@ class HudWindow(QMainWindow):
         self._nav_last_row = [0, 0, 0, 0]
         self._scrub_mode = False  # True when actively scrubbing with arrows
         self._speed_mode = False  # True when selecting playback speed with arrows
+        # Goal-pick modes hijack arrow keys to move a crosshair on the
+        # ODOM / GPS data-column plot. Coordinates are stored as the
+        # target the operator is currently aiming at (map-frame x/y for
+        # local, lat/lon for GPS). See _enter_*_goal_mode handlers.
+        self._local_goal_mode = False
+        self._gps_goal_mode = False
+        self._local_goal_x = 0.0
+        self._local_goal_y = 0.0
+        self._gps_goal_lat = 0.0
+        self._gps_goal_lon = 0.0
 
         self._sel_frames_r = [' <', '< ']
         self._sel_frames_l = ['> ', ' >']
@@ -3733,35 +3744,171 @@ class HudWindow(QMainWindow):
                 break
         self._refresh_terminal_display()
 
-    def _on_send_goal_clicked(self):
-        """Run ./config/send_goal.sh with the args from the textfield."""
-        args = self._send_goal_input.text().strip()
-        # Hand focus back to the main window so arrow-key nav resumes
-        # instead of staying trapped inside the QLineEdit.
-        self._send_goal_input.clearFocus()
-        self.setFocus(Qt.OtherFocusReason)
-        self._run_one_shot_script(
-            label="Send Goal",
-            script="./config/send_goal.sh",
-            args=args,
-        )
+    # --- Goal-pick modes -------------------------------------------------
+    # Two operator-facing modes that hijack arrow keys to position a
+    # crosshair on a data-column plot. Each is entered by clicking a
+    # launch-page button; arrows nudge the target, Enter fires the
+    # corresponding script, Esc cancels. Local picks use 0.1 m so the
+    # operator can park within wheelbase tolerance; GPS picks use 1.0 m
+    # (lat/lon converted via the WGS84 small-step approx) since the
+    # waypoint radius soaks up sub-meter precision anyway.
+    _LOCAL_GOAL_STEP_M = 0.1
+    _GPS_GOAL_STEP_M = 1.0
 
-    def _on_send_gps_clicked(self):
-        """Run ./config/send_GPS_waypoint.sh with the args from the textfield.
-
-        Commas in the field (e.g. ``37.23028, -80.42502``) are normalized
-        to spaces so the script's positional <lat> <lon> [radius] parser
-        accepts the input as-pasted from a maps app.
-        """
-        raw = self._send_gps_input.text().strip()
-        args = re.sub(r'[,\s]+', ' ', raw).strip()
-        self._send_gps_input.clearFocus()
-        self.setFocus(Qt.OtherFocusReason)
-        self._run_one_shot_script(
-            label="Send GPS",
-            script="./config/send_GPS_waypoint.sh",
-            args=args,
+    def _enter_local_goal_mode(self):
+        """Show the local-goal crosshair on the ODOM plot and seed the
+        target at the robot's current map-frame pose."""
+        if self._gps_goal_mode:
+            self._exit_gps_goal_mode(send=False)
+        xs = self._odom_buf.get('x')
+        ys = self._odom_buf.get('y')
+        if not xs or not ys:
+            self._gui_log_msg(
+                "Set Local Goal: no odom yet — start the Local EKF first"
+            )
+            return
+        self._local_goal_x = float(xs[-1])
+        self._local_goal_y = float(ys[-1])
+        self._local_goal_mode = True
+        self._odom_goal_cross.set_data([self._local_goal_x], [self._local_goal_y])
+        self._odom_goal_cross.set_visible(True)
+        self._odom_goal_banner.set_visible(True)
+        self._odom_goal_readout.set_visible(True)
+        self._odom_goal_readout.set_text(
+            f"x={self._local_goal_x:.2f}  y={self._local_goal_y:.2f}"
         )
+        self._odom_canvas.draw_idle()
+        self._update_selection()
+
+    def _exit_local_goal_mode(self, send):
+        """Hide the crosshair. If `send`, fire send_goal.sh with the
+        picked map-frame x/y."""
+        if not self._local_goal_mode:
+            return
+        self._local_goal_mode = False
+        self._odom_goal_cross.set_visible(False)
+        self._odom_goal_banner.set_visible(False)
+        self._odom_goal_readout.set_visible(False)
+        self._odom_canvas.draw_idle()
+        self._update_selection()
+        if send:
+            args = f"{self._local_goal_x:.3f} {self._local_goal_y:.3f}"
+            self._run_one_shot_script(
+                label="Send Goal",
+                script="./config/send_goal.sh",
+                args=args,
+            )
+
+    def _move_local_goal(self, dx, dy):
+        """Nudge the local-goal crosshair by (dx, dy) meters in the map
+        frame and refresh the readout. If the new position falls outside
+        the current ODOM viewport, expand the limits immediately so the
+        crosshair stays visible without waiting for the next live tick."""
+        self._local_goal_x += dx
+        self._local_goal_y += dy
+        self._odom_goal_cross.set_data([self._local_goal_x], [self._local_goal_y])
+        self._odom_goal_readout.set_text(
+            f"x={self._local_goal_x:.2f}  y={self._local_goal_y:.2f}"
+        )
+        # Auto-pan/zoom so the crosshair is never off-screen between
+        # arrow presses. Margin sized for visible breathing room — the
+        # crosshair should clearly sit *inside* the viewport, not on
+        # the edge. The next live-tick redraw re-derives the bounds
+        # (also including the goal — see _redraw_plots) so any pad here
+        # gets normalized within ~100-200 ms.
+        x0, x1 = self._odom_ax.get_xlim()
+        y0, y1 = self._odom_ax.get_ylim()
+        margin = 2.0
+        gx, gy = self._local_goal_x, self._local_goal_y
+        new_x0 = min(x0, gx - margin)
+        new_x1 = max(x1, gx + margin)
+        new_y0 = min(y0, gy - margin)
+        new_y1 = max(y1, gy + margin)
+        if (new_x0, new_x1, new_y0, new_y1) != (x0, x1, y0, y1):
+            self._odom_ax.set_xlim(new_x0, new_x1)
+            self._odom_ax.set_ylim(new_y0, new_y1)
+        self._odom_canvas.draw_idle()
+
+    def _enter_gps_goal_mode(self):
+        """Show the GPS-goal crosshair on the GPS map and seed the target
+        at the latest fix. Refuses if no GPS fix is in the buffer."""
+        if self._local_goal_mode:
+            self._exit_local_goal_mode(send=False)
+        lats = self._gps_buf.get('lat')
+        lons = self._gps_buf.get('lon')
+        if not lats or not lons:
+            self._gui_log_msg(
+                "Set GPS Goal: no GPS fix yet — wait for a lock"
+            )
+            return
+        self._gps_goal_lat = float(lats[-1])
+        self._gps_goal_lon = float(lons[-1])
+        self._gps_goal_mode = True
+        self._gps_goal_cross.set_data([self._gps_goal_lon], [self._gps_goal_lat])
+        self._gps_goal_cross.set_visible(True)
+        self._gps_goal_banner.set_visible(True)
+        self._gps_goal_readout.set_visible(True)
+        self._gps_goal_readout.set_text(
+            f"{self._gps_goal_lat:.6f}, {self._gps_goal_lon:.6f}"
+        )
+        self._gps_canvas.draw_idle()
+        self._update_selection()
+
+    def _exit_gps_goal_mode(self, send):
+        """Hide the crosshair. If `send`, fire send_GPS_waypoint.sh with
+        the picked lat/lon."""
+        if not self._gps_goal_mode:
+            return
+        self._gps_goal_mode = False
+        self._gps_goal_cross.set_visible(False)
+        self._gps_goal_banner.set_visible(False)
+        self._gps_goal_readout.set_visible(False)
+        self._gps_canvas.draw_idle()
+        self._update_selection()
+        if send:
+            args = f"{self._gps_goal_lat:.7f} {self._gps_goal_lon:.7f}"
+            self._run_one_shot_script(
+                label="Send GPS",
+                script="./config/send_GPS_waypoint.sh",
+                args=args,
+            )
+
+    def _move_gps_goal(self, d_north_m, d_east_m):
+        """Nudge the GPS-goal crosshair by (north, east) meters and
+        refresh the readout. Uses a WGS84 small-step approximation.
+        If the new position falls outside the current GPS viewport,
+        expand the limits immediately so the crosshair stays visible
+        without waiting for the next live tick."""
+        dlat = d_north_m / 111320.0
+        dlon = d_east_m / (
+            111320.0 * max(0.1, math.cos(math.radians(self._gps_goal_lat)))
+        )
+        self._gps_goal_lat += dlat
+        self._gps_goal_lon += dlon
+        self._gps_goal_cross.set_data([self._gps_goal_lon], [self._gps_goal_lat])
+        self._gps_goal_readout.set_text(
+            f"{self._gps_goal_lat:.6f}, {self._gps_goal_lon:.6f}"
+        )
+        # Auto-pan/zoom so the crosshair is never off-screen between
+        # arrow presses. Margin sized for visible breathing room — the
+        # crosshair should clearly sit *inside* the viewport, not on
+        # the edge.
+        x0, x1 = self._gps_ax.get_xlim()
+        y0, y1 = self._gps_ax.get_ylim()
+        margin_m = 5.0
+        margin_lat = margin_m / 111320.0
+        margin_lon = margin_m / (
+            111320.0 * max(0.1, math.cos(math.radians(self._gps_goal_lat)))
+        )
+        gx, gy = self._gps_goal_lon, self._gps_goal_lat
+        new_x0 = min(x0, gx - margin_lon)
+        new_x1 = max(x1, gx + margin_lon)
+        new_y0 = min(y0, gy - margin_lat)
+        new_y1 = max(y1, gy + margin_lat)
+        if (new_x0, new_x1, new_y0, new_y1) != (x0, x1, y0, y1):
+            self._gps_ax.set_xlim(new_x0, new_x1)
+            self._gps_ax.set_ylim(new_y0, new_y1)
+        self._gps_canvas.draw_idle()
 
     def _run_one_shot_script(self, label, script, args):
         """Fire-and-forget runner for the send_goal/send_GPS scripts.
@@ -4127,6 +4274,24 @@ class HudWindow(QMainWindow):
         self._branches_nav_buttons = head_entries + new_branch_entries + (
             [exit_entry] if exit_entry else []
         )
+
+        # _show_branches_page assigns self._nav_groups[0] = self._branches_nav_buttons
+        # BEFORE this method rebuilds the list, so the nav group ends up
+        # pointing at the old (pre-refresh) entries — arrow keys then only
+        # see Refresh + Back. Re-bind here so arrow nav reaches the
+        # branch buttons that were just added.
+        if (
+            hasattr(self, '_options_stack')
+            and self._options_stack.currentIndex() == 5
+            and hasattr(self, '_nav_groups')
+            and self._nav_groups
+        ):
+            self._nav_groups[0] = self._branches_nav_buttons
+            n = len(self._branches_nav_buttons)
+            if n and self._nav_col == 0:
+                self._nav_row = min(self._nav_row, n - 1)
+                self._nav_last_row[0] = self._nav_row
+                self._update_selection()
 
     def _dev_ahead_behind(self, branch):
         rc, out, _err = self._dev_run_git([
@@ -6301,6 +6466,40 @@ class HudWindow(QMainWindow):
             self._request_record_toggle()
             return
 
+        # --- Local goal-pick mode: arrows nudge map-frame target, Enter sends, Esc cancels ---
+        if self._local_goal_mode:
+            step = self._LOCAL_GOAL_STEP_M
+            if key == Qt.Key_Up:
+                self._move_local_goal(0.0, step)
+            elif key == Qt.Key_Down:
+                self._move_local_goal(0.0, -step)
+            elif key == Qt.Key_Right:
+                self._move_local_goal(step, 0.0)
+            elif key == Qt.Key_Left:
+                self._move_local_goal(-step, 0.0)
+            elif key in (Qt.Key_Return, Qt.Key_Enter):
+                self._exit_local_goal_mode(send=True)
+            elif key == Qt.Key_Escape:
+                self._exit_local_goal_mode(send=False)
+            return
+
+        # --- GPS goal-pick mode: arrows nudge lat/lon, Enter sends, Esc cancels ---
+        if self._gps_goal_mode:
+            step = self._GPS_GOAL_STEP_M
+            if key == Qt.Key_Up:
+                self._move_gps_goal(step, 0.0)
+            elif key == Qt.Key_Down:
+                self._move_gps_goal(-step, 0.0)
+            elif key == Qt.Key_Right:
+                self._move_gps_goal(0.0, step)
+            elif key == Qt.Key_Left:
+                self._move_gps_goal(0.0, -step)
+            elif key in (Qt.Key_Return, Qt.Key_Enter):
+                self._exit_gps_goal_mode(send=True)
+            elif key == Qt.Key_Escape:
+                self._exit_gps_goal_mode(send=False)
+            return
+
         # --- Scrub mode: arrows move the slider, Enter exits ---
         if self._scrub_mode:
             slider = self.pb_slider
@@ -6395,14 +6594,7 @@ class HudWindow(QMainWindow):
                 self._toggle_sensor_expand(cell)
             else:
                 widget, _, _ = self._cur_btn()
-                if isinstance(widget, QLineEdit):
-                    # Hand keyboard focus to the field so the operator
-                    # can type. Pressing Enter inside the field fires
-                    # returnPressed → _on_send_*_clicked, which calls
-                    # clearFocus to hand control back to nav.
-                    widget.setFocus(Qt.OtherFocusReason)
-                    widget.selectAll()
-                elif widget.isEnabled():
+                if widget.isEnabled():
                     widget.click()
         elif key == Qt.Key_Space:
             if self._pb_state in ('playing', 'paused', 'ended'):
@@ -6434,18 +6626,21 @@ class HudWindow(QMainWindow):
                         .replace("color: #dcdcdc", "color: #0f0")
                     ))
                 elif widget in self._sensor_cells or widget is self._power_cell:
-                    if is_selected:
+                    # Goal-pick mode wins over nav selection — the cyan
+                    # border tells the operator which plot the crosshair
+                    # is being placed on.
+                    goal_active = (
+                        (self._local_goal_mode
+                         and widget is self._canvas_to_cell.get(self._odom_canvas))
+                        or (self._gps_goal_mode
+                            and widget is self._canvas_to_cell.get(self._gps_canvas))
+                    )
+                    if goal_active:
+                        widget.setStyleSheet(T(self._sensor_goal_style))
+                    elif is_selected:
                         widget.setStyleSheet(T(self._sensor_sel_style))
                     else:
                         widget.setStyleSheet(T(self._sensor_frame_style))
-                elif isinstance(widget, QLineEdit):
-                    # QLineEdit nav participation. Don't call setText —
-                    # that would clobber the user's typed value. Highlight
-                    # via stylesheet instead.
-                    if is_selected:
-                        widget.setStyleSheet(T(self._send_field_sel_style))
-                    else:
-                        widget.setStyleSheet(T(base_style))
                 else:
                     # Check if this is the selected device button
                     is_selected_device = False
@@ -7546,8 +7741,25 @@ class HudWindow(QMainWindow):
             cur_lat, cur_lon = lats[-1], lons[-1]
             dlat = _GPS_VIEW_RADIUS_M / 111320.0
             dlon = _GPS_VIEW_RADIUS_M / (111320.0 * math.cos(math.radians(cur_lat)))
-            self._gps_ax.set_xlim(cur_lon - dlon, cur_lon + dlon)
-            self._gps_ax.set_ylim(cur_lat - dlat, cur_lat + dlat)
+            x0, x1 = cur_lon - dlon, cur_lon + dlon
+            y0, y1 = cur_lat - dlat, cur_lat + dlat
+            # If the operator is placing a GPS goal and has arrowed past
+            # the default 100 ft window, extend the view to include the
+            # crosshair plus a 5 m breathing-room buffer so it doesn't
+            # sit on the edge. The next redraw after _exit_gps_goal_mode
+            # skips this branch, so the view snaps back on send/cancel.
+            if self._gps_goal_mode:
+                buf_m = 5.0
+                buf_lat = buf_m / 111320.0
+                buf_lon = buf_m / (
+                    111320.0 * max(0.1, math.cos(math.radians(self._gps_goal_lat)))
+                )
+                x0 = min(x0, self._gps_goal_lon - buf_lon)
+                x1 = max(x1, self._gps_goal_lon + buf_lon)
+                y0 = min(y0, self._gps_goal_lat - buf_lat)
+                y1 = max(y1, self._gps_goal_lat + buf_lat)
+            self._gps_ax.set_xlim(x0, x1)
+            self._gps_ax.set_ylim(y0, y1)
             # Show lat/lon truncated to 4 decimals
             self._gps_coord_label.set_text(
                 f"Lat: {cur_lat:.4f}\nLon: {cur_lon:.4f}"
@@ -7626,6 +7838,18 @@ class HudWindow(QMainWindow):
                 max_x = max(max_x, cm_x1)
                 min_y = min(min_y, cm_y0)
                 max_y = max(max_y, cm_y1)
+            # If the operator is currently placing a local goal, include
+            # the crosshair (plus a buffer) in the bounds so arrowing
+            # past the visible area auto-zooms with breathing room
+            # instead of pinning the crosshair to the edge. The next
+            # redraw after _exit_local_goal_mode skips this branch, so
+            # the view snaps back to the normal bounds on send/cancel.
+            if self._local_goal_mode:
+                buf = 2.0
+                min_x = min(min_x, self._local_goal_x - buf)
+                max_x = max(max_x, self._local_goal_x + buf)
+                min_y = min(min_y, self._local_goal_y - buf)
+                max_y = max(max_y, self._local_goal_y + buf)
             dx = max_x - min_x
             dy = max_y - min_y
             span = max(dx, dy) * 1.3

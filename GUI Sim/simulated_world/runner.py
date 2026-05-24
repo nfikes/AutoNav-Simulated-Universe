@@ -372,6 +372,25 @@ def main():
     print('[debug] F9 toggles REC overlay, F10 toggles AUTO badge',
           flush=True)
 
+    # Auto-connect to the (faked) container and enter Live Mode so the
+    # GUI's _live_tick starts draining node.latest_* into the data
+    # buffers. Without this, _odom_buf / _gps_buf stay empty and the
+    # new goal-pick buttons ("Set Local Goal…" / "Set GPS Goal…")
+    # refuse to enter their crosshair mode. The sim driver above is
+    # already feeding /odom and /gps_fix; we just need the consumer
+    # loop turned on. Deferred via singleShot so the Qt event loop
+    # finishes laying out the window before we start mutating state.
+    def _auto_enter_live():
+        try:
+            if not window._container_connected:
+                window._connect_container()
+            if not getattr(window, '_live_active', False):
+                window._start_live_mode()
+            print('[debug] Auto-connected and entered Live Mode', flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f'[debug] Auto-enter Live failed: {e}', flush=True)
+    QTimer.singleShot(300, _auto_enter_live)
+
     exit_code = app.exec_()
     sys.exit(exit_code)
 
