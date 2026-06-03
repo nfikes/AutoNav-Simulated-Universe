@@ -82,4 +82,4 @@ GUI Sim/data/manual_*/
 *.blend1
 
 # Editor / Claude local state
-.claude/settings.local.json
+**/.claude/settings.local.json
