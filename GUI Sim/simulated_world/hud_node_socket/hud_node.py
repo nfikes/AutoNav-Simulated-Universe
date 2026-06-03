@@ -20,7 +20,7 @@ try:
     from sensor_msgs.msg import Image, LaserScan, NavSatFix, Imu, PointCloud2, Joy
     from nav_msgs.msg import Odometry, OccupancyGrid, Path
     from geometry_msgs.msg import PoseWithCovarianceStamped
-    from std_msgs.msg import Float32, Int32MultiArray, Bool
+    from std_msgs.msg import Float32, Int32, Int32MultiArray, Bool
     try:
         from sensor_msgs_py import point_cloud2 as _pc2
         _HAS_PC2 = True
@@ -752,11 +752,10 @@ class _LidarFrameWorker(QObject):
 
 from PyQt5.QtCore import (
     QEasingCurve, QEvent, QParallelAnimationGroup, QPoint,
-    QPropertyAnimation, QRect, Qt, QTimer,
+    QPropertyAnimation, Qt, QTimer,
 )
 from PyQt5.QtGui import (
-    QBrush, QColor, QFont, QKeyEvent, QPainter, QPalette, QPen, QPolygon,
-    QRegion,
+    QColor, QFont, QKeyEvent, QPainter, QPalette, QPen, QPolygon,
 )
 from PyQt5.QtWidgets import (
     QApplication,
@@ -916,7 +915,6 @@ class _ModeOverlay(QWidget):
         self._diag = max(1, int(sh / _math.tan(_math.radians(60.0))))
         widget_w = 2 * sw + self._diag
         self.setFixedSize(widget_w, sh)
-        # Recenter labels for whatever state we're in.
         self._apply_state(self._state, animate=False)
 
     def paintEvent(self, event):
@@ -970,24 +968,22 @@ class _ModeOverlay(QWidget):
         """Return (perf, stats, rec) widget-local top-left QPoints for
         the three labels at the given state."""
         W, H, D = self._sw, self._sh, self._diag
-        offset_both = (W + D) // 2  # widget local x of the screen origin in BOTH
+        offset_both = (W + D) // 2
 
         if state == self.PERF:
             perf_cx = W // 2
-            rec_cx = W + D + W // 2  # off-screen-right — never visible
+            rec_cx = W + D + W // 2
         elif state == self.REC:
-            perf_cx = W // 2  # off-screen-left — never visible
+            perf_cx = W // 2
             rec_cx = W + D + W // 2
         elif state == self.BOTH:
-            # Trapezoid centroids in screen coords: (W/4, H/2) and (3W/4, H/2).
             perf_cx = W // 4 + offset_both
             rec_cx = 3 * W // 4 + offset_both
-        else:  # OFF — leave wherever they were
+        else:
             return (self.perf_label.pos(), self.perf_stats_label.pos(),
                     self.rec_label.pos())
 
         cy = H // 2
-        # Stack the stats label below the PERF title.
         stats_cy = cy + self.perf_label.height() // 2 + 12 \
             + self.perf_stats_label.height() // 2
         return (
@@ -1008,14 +1004,12 @@ class _ModeOverlay(QWidget):
             self._anim = None
 
         if new_state == self.OFF:
-            # Slide off in the direction that matches the colour just
-            # deactivated, then hide.
             if prev == self.PERF:
-                off_pos = QPoint(self._sw, 0)  # right
+                off_pos = QPoint(self._sw, 0)
             elif prev == self.REC:
-                off_pos = QPoint(-(2 * self._sw + self._diag), 0)  # left
+                off_pos = QPoint(-(2 * self._sw + self._diag), 0)
             else:
-                off_pos = self.pos()  # snap-hide for unusual paths
+                off_pos = self.pos()
 
             def _on_done():
                 self.hide()
@@ -1034,8 +1028,6 @@ class _ModeOverlay(QWidget):
             self._state = new_state
             return
 
-        # Active-to-active transition — full animation of widget pos
-        # and all label positions in parallel.
         self._apply_state(new_state, animate=animate)
         self._state = new_state
 
@@ -1128,8 +1120,29 @@ class HudWindow(QMainWindow):
         super().__init__()
         self._ros_node = ros_node
         self.setWindowTitle('AutoNav HUD')
-        self.resize(1920, 720)
-        self.showFullScreen()
+        # Hard kiosk geometry instead of showFullScreen(). The panel is
+        # 1920x720 native; relying on Mutter's fullscreen state has been
+        # unreliable (top bar leaks, bottom clipped) and the display
+        # stack on the Jetson has been reporting a 1920x1080 virtual
+        # framebuffer of which only the top 720 rows reach the panel —
+        # so a 1080-tall fullscreen window loses its bottom 1/3.
+        # Frameless + X11BypassWindowManagerHint takes the window out
+        # from under the WM entirely; we place it at (0,0) at exact
+        # panel size so nothing the compositor does can shift it.
+        self.setWindowFlags(
+            Qt.FramelessWindowHint | Qt.X11BypassWindowManagerHint
+        )
+        # Bypassing the WM means it won't size/place/focus the window for us.
+        # Lock size before show() so Qt's geometry path can't drift to the
+        # X server's misreported 1920x1080 framebuffer, then re-pin position
+        # and manually activate + take keyboard focus after show().
+        self.setFixedSize(1920, 720)
+        self.setGeometry(0, 0, 1920, 720)
+        self.show()
+        self.move(0, 0)
+        self.activateWindow()
+        self.raise_()
+        self.setFocus(Qt.ActiveWindowFocusReason)
         self.setCursor(Qt.BlankCursor)
 
         # GUI defaults to light theme. The widget tree is built in dark
@@ -1380,17 +1393,18 @@ class HudWindow(QMainWindow):
         # the window owns is paused (live tick, playback, EKF pulse,
         # process polling, etc.) so the GUI hovers at near-zero CPU
         # behind a translucent blue panel with a giant centred
-        # "PERFORMANCE" label. _perf_resume_timers stores the timers
-        # we stopped so toggle-off resumes exactly those that were
-        # running on entry — anything started while in performance
-        # mode is left alone.
-
+        # "PERFORMANCE" label and a Before/Now CPU/GPU comparison.
+        # _perf_resume_timers stores the timers we stopped so toggle-off
+        # resumes exactly those that were running on entry — anything
+        # started while in performance mode is left alone.
         self._performance_mode = False
         self._perf_resume_timers = []
-        # Unified mode overlay — built lazily; carries both PERF + REC
-        # veils with a 60° diagonal split. self._perf_stats_label is
-        # aliased to the overlay's stats QLabel after construction so
-        # the existing CPU/GPU update path keeps working unchanged.
+        # Unified mode overlay — single wide widget that carries both
+        # PERF (blue) and REC (red) veils with a 60° diagonal split.
+        # Translated horizontally to expose PERF / REC / BOTH. Built
+        # lazily on first use; _perf_stats_label is aliased to the
+        # overlay's stats QLabel so the existing CPU/GPU update path
+        # keeps working with no other changes.
         self._mode_overlay = None
         self._perf_stats_label = None
         # 5 s sampler runs CONTINUOUSLY (not just in Perf mode) so the
@@ -1408,8 +1422,7 @@ class HudWindow(QMainWindow):
                 self._perf_proc = psutil.Process()
                 # Prime per-process cpu_percent so the first reading
                 # reflects real work, not the all-time-since-start
-                # fallback. (System cpu_percent doesn't need priming
-                # because we're not reading it any more.)
+                # fallback.
                 self._perf_proc.cpu_percent(interval=None)
                 self._perf_cpu_count = max(1, psutil.cpu_count(logical=True))
             except Exception:
@@ -1427,6 +1440,11 @@ class HudWindow(QMainWindow):
 
         # Container connection state
         self._container_connected = False
+        # Sticky "user explicitly disconnected" flag. The 5 Hz health
+        # check auto-connects whenever the container is up AND this flag
+        # is False; the user clicking Disconnect sets it True so we stop
+        # reconnecting until they click Connect again.
+        self._container_user_disconnected = False
         self._container_name = 'koopa-kingdom'
         self._container_workdir = '/autonav/isaac_ros-dev'
         self._container_user = 'admin'
@@ -1631,6 +1649,13 @@ class HudWindow(QMainWindow):
         self._bag_play_poll_timer = QTimer(self)
         self._bag_play_poll_timer.setInterval(500)
         self._bag_play_poll_timer.timeout.connect(self._bag_play_poll)
+
+        # HUD-driven `ros2 bag record` subprocess — spawned by the R
+        # key (see _request_record_toggle) so the operator can record
+        # at any moment without launching a test script. Output lands
+        # under _CSV_DIR/manual_<stamp>/bag/ so a fresh session shows
+        # up in the Playback Mode grid as soon as recording stops.
+        self._hud_bag_proc = None
 
         # Performance Mode — last entry in the action stack. Toggles a
         # near-zero-CPU veil that pauses every QTimer the window owns.
@@ -2199,13 +2224,13 @@ class HudWindow(QMainWindow):
         lbl_git.setStyleSheet(group_label_style)
         dev_layout.addWidget(lbl_git)
 
-        self._dev_pull_btn = QPushButton("git sync (hard)")
+        self._dev_pull_btn = QPushButton("git sync")
         self._dev_pull_btn.setStyleSheet(dev_btn_compact)
         self._dev_pull_btn.setFocusPolicy(Qt.NoFocus)
         self._dev_pull_btn.clicked.connect(self._dev_git_pull)
         dev_layout.addWidget(self._dev_pull_btn)
         self._dev_nav_buttons.append(
-            (self._dev_pull_btn, "git sync (hard)", dev_btn_compact)
+            (self._dev_pull_btn, "git sync", dev_btn_compact)
         )
 
         # Branch switching is on its own sub-page (one click deeper) so
@@ -3133,11 +3158,15 @@ class HudWindow(QMainWindow):
         self._process_poll_timer.timeout.connect(self._poll_process_output)
         self._process_poll_timer.start()
 
-        # Container health check — every 5 seconds
+        # Container health check — every 5 seconds. Also does the
+        # auto-connect job (see _check_container_health). Fire one early
+        # check ~1 s after startup so the operator doesn't have to wait
+        # the full 5 s tick for the first auto-connect attempt.
         self._container_health_timer = QTimer()
         self._container_health_timer.setInterval(5000)
         self._container_health_timer.timeout.connect(self._check_container_health)
         self._container_health_timer.start()
+        QTimer.singleShot(1000, self._check_container_health)
 
         # Duplicate-publisher detector — polls topics from config/
         # watched_topics.yaml at 0.1 Hz. Flags device dots red when
@@ -3263,15 +3292,25 @@ class HudWindow(QMainWindow):
         # over the layout; _position_auto_badge keeps it pinned to the
         # top-right on resize.
         self._auto_mode = False
+        # Status-pill styling for both themes. ON is a solid green pill
+        # with white text (high contrast, unmistakable). OFF is a ghost
+        # outline with no fill so it doesn't read as a "gray rectangle"
+        # against either dark or light backgrounds. Rgba() values are
+        # intentionally theme-agnostic — _recolor_widget_tree only
+        # translates #rrggbb literals, so we picked colors that read
+        # well in either theme rather than relying on the translate.
         self._auto_badge_on_style = (
-            "color: #0f0; font-size: 13px; font-weight: bold;"
-            " font-family: monospace; background-color: rgba(0, 40, 0, 200);"
-            " border: 1px solid #0f0; border-radius: 4px; padding: 3px 8px;"
+            "color: #ffffff; font-size: 12px; font-weight: bold;"
+            " font-family: monospace; letter-spacing: 1px;"
+            " background-color: #16a834;"
+            " border: none; border-radius: 10px; padding: 2px 10px;"
         )
         self._auto_badge_off_style = (
-            "color: #666; font-size: 13px; font-weight: bold;"
-            " font-family: monospace; background-color: rgba(20, 20, 20, 180);"
-            " border: 1px solid #444; border-radius: 4px; padding: 3px 8px;"
+            "color: #888888; font-size: 12px; font-weight: bold;"
+            " font-family: monospace; letter-spacing: 1px;"
+            " background-color: transparent;"
+            " border: none;"
+            " padding: 2px 10px;"
         )
         self._auto_badge = QLabel("AUTO OFF", central)
         self._auto_badge.setStyleSheet(self._auto_badge_off_style)
@@ -3285,6 +3324,22 @@ class HudWindow(QMainWindow):
         # event loop processes the show + first layout pass, when
         # parent.width() reflects the real geometry.
         QTimer.singleShot(0, self._position_auto_badge)
+
+        # Manual Drive mode — 'M' key toggles a green overlay and routes
+        # arrow keys to synthetic /joy messages (same path the Xbox stick
+        # uses, via control.cpp's tank-drive axes[1]/axes[3] mapping).
+        # Esc also exits. Held arrows are accumulated in _manual_keys;
+        # a 20 Hz timer publishes the resulting Joy. control.cpp gates
+        # /joy on !autonomousMode, so _toggle_manual_mode disengages
+        # AUTO on entry. All state is built lazily in _toggle_manual_mode
+        # / _build_manual_overlay.
+        self._manual_mode = False
+        self._manual_keys = set()
+        self._manual_overlay = None
+        self._MANUAL_STICK_MAG = 0.8   # axis magnitude when a direction key is held
+        self._manual_timer = QTimer(self)
+        self._manual_timer.setInterval(50)  # 20 Hz
+        self._manual_timer.timeout.connect(self._manual_tick)
 
         self._update_selection()
 
@@ -4124,12 +4179,46 @@ class HudWindow(QMainWindow):
                 return True
         return False
 
-    def _dev_git_hard_sync(self, log=None):
-        """Force the host repo to match origin/<current-branch>.
+    def _dev_reclaim_repo_ownership(self, log=None):
+        """Best-effort passwordless-sudo chown of the host repo back to
+        the GUI's user. The Docker container (koopa-kingdom) runs as
+        root, so build artifacts and any files it touches end up
+        root-owned; the subsequent `git reset --hard` and `git clean
+        -fd` then fail with Permission denied for the non-root GUI
+        user. Returns True on success, False if sudo wasn't passwordless
+        or the chown errored — callers should continue either way and
+        let the real git error surface."""
+        try:
+            uid = os.geteuid()
+            gid = os.getegid()
+            r = subprocess.run(
+                ['sudo', '-n', 'chown', '-R', f'{uid}:{gid}',
+                 self._dev_host_repo],
+                capture_output=True, text=True, timeout=30,
+            )
+            if log is not None:
+                log(f"$ sudo -n chown -R {uid}:{gid} {self._dev_host_repo}")
+                if r.stderr.strip():
+                    log(r.stderr.strip())
+            return r.returncode == 0
+        except subprocess.TimeoutExpired:
+            if log is not None:
+                log("[chown skipped] sudo chown timed out")
+            return False
+        except Exception as e:
+            if log is not None:
+                log(f"[chown skipped] {e}")
+            return False
 
-        Sequence: fetch → reset --hard origin/<branch> → clean -fd →
-        submodule update --init --recursive. Untracked files in the
-        working tree are deleted; gitignored build artifacts are kept.
+    def _dev_git_sync(self, log=None):
+        """Fast-forward the host repo to origin/<current-branch>.
+
+        Sequence: reclaim ownership (best-effort sudo chown) →
+        git pull --ff-only origin <branch> → submodule update
+        --init --recursive. Replaces the old reset --hard + clean -fd
+        flow, which kept tripping Permission denied on root-owned
+        artifacts left by the Docker container. --ff-only fails loudly
+        if the branch has diverged rather than rewriting history.
 
         Returns (ok: bool, summary: str). When `log` is provided, every
         sub-step's stdout/stderr is passed to it.
@@ -4143,10 +4232,13 @@ class HudWindow(QMainWindow):
         if rc_b != 0 or not branch:
             return False, f"branch lookup failed: {err_b or 'detached HEAD'}"
 
+        # Reclaim ownership before pulling. Failure is silent — if
+        # passwordless sudo isn't configured, the git step below will
+        # surface the real Permission denied with a hint.
+        self._dev_reclaim_repo_ownership(log=log)
+
         for step_args, step_timeout in (
-            (['fetch', 'origin', '--prune'], 60),
-            (['reset', '--hard', f'origin/{branch}'], 30),
-            (['clean', '-fd'], 30),
+            (['pull', '--ff-only', 'origin', branch], 60),
             (['submodule', 'update', '--init', '--recursive'], 120),
         ):
             _emit(f"$ git {' '.join(step_args)}")
@@ -4154,16 +4246,31 @@ class HudWindow(QMainWindow):
             _emit(out)
             _emit(err)
             if rc != 0:
+                combined = f"{err}\n{out}"
                 msg = (err or out or 'unknown').splitlines()[-1]
+                if 'Permission denied' in combined:
+                    msg = (
+                        f"{msg}  (root-owned files in tree — run "
+                        f"`sudo chown -R $(id -u):$(id -g) "
+                        f"{self._dev_host_repo}` on the Jetson, or "
+                        f"enable passwordless sudo for chown)"
+                    )
+                elif 'Not possible to fast-forward' in combined or \
+                        'diverged' in combined.lower():
+                    msg = (
+                        f"{msg}  (branch diverged from origin — resolve "
+                        f"on the Jetson with `git status` / `git log`, "
+                        f"then re-sync)"
+                    )
                 return False, f"git {step_args[0]} failed: {msg}"
 
-        return True, f"synced to origin/{branch}"
+        return True, f"pulled origin/{branch}"
 
     def _dev_git_pull(self):
         self._dev_set_status(
-            "Hard-syncing to origin/<branch>…", color='#ff0')
+            "Pulling origin/<branch>…", color='#ff0')
         QApplication.processEvents()
-        ok, summary = self._dev_git_hard_sync()
+        ok, summary = self._dev_git_sync()
         if ok:
             self._dev_set_status(f"Sync OK: {summary}", color='#0f0')
         else:
@@ -4622,12 +4729,12 @@ class HudWindow(QMainWindow):
                 # start step below will surface real issues.
                 log(f"[stop] {e}")
 
-            # 2. Hard-sync host repo to origin/<branch> — discards any
-            #    local edits and untracked files so the Jetson tree
-            #    always matches origin.
+            # 2. Fast-forward pull host repo to origin/<branch>. Fails
+            #    loudly if the branch has diverged — the Jetson tree is
+            #    expected to be pristine (no local edits / commits).
             self._dev_ui_status(
-                "[2/5] git hard-sync to origin…", color='#ff0')
-            ok, summary = self._dev_git_hard_sync(log=log)
+                "[2/5] git pull origin…", color='#ff0')
+            ok, summary = self._dev_git_sync(log=log)
             if not ok:
                 self._dev_ui_status(
                     f"Sync failed: {summary}", color='#f44')
@@ -4816,6 +4923,14 @@ class HudWindow(QMainWindow):
         except Exception as e:
             buf.append(f"[ERROR] Failed to launch: {e}\n")
             self._gui_log_msg(f"Test {tid} failed to launch: {e}")
+
+        # Point the terminal pane at this test's buffer so the operator
+        # sees the automator's WARMING UP / READY banners and knows when
+        # the physical Xbox A press will produce a useful bag. Every
+        # other launcher (mission, build, install) does the same thing.
+        self._selected_process = test_label
+        self._term_last_text = ''
+        self._refresh_terminal_display()
 
         self._update_selection()
 
@@ -5729,7 +5844,7 @@ class HudWindow(QMainWindow):
         GUI CPU is per-process, normalised by total logical-core count
         so a single saturated core reads as 100/N% (matches Task
         Manager's column). GPU is whole-device — per-process GPU isn't
-        reliably queryable across drivers, and on a dev laptop the GUI
+        reliably queryable across drivers, and on the Jetson the GUI
         is the dominant graphics client so this is a fair proxy for
         what the HUD is costing the GPU.
         """
@@ -5781,9 +5896,9 @@ class HudWindow(QMainWindow):
         Iterating __dict__ catches new timers added in the future
         automatically; isActive() filters down to the ones that were
         genuinely running so toggle-off doesn't kick idle timers awake.
-        The perf-stats ticker is skipped here and started right after
-        — it's the one timer that stays alive while the veil is up so
-        the CPU/GPU readout keeps refreshing.
+        The perf-stats sampler is skipped here — it's the one timer
+        that stays alive while the veil is up so the CPU/GPU readout
+        keeps refreshing.
         """
         if self._performance_mode:
             return
@@ -5796,16 +5911,17 @@ class HudWindow(QMainWindow):
 
         self._performance_mode = True
         self._perf_resume_timers = []
-        # Two timers stay alive in Perf mode:
-        #   _perf_stats_timer  — drives the 5 s CPU/GPU readout.
-        #   _rec_timer         — keeps the REC overlay reactive to
-        #                        /data/toggle_collect so the operator
-        #                        can split the screen even while
-        #                        throttled. Both are cheap.
-        always_on = {self._perf_stats_timer, self._rec_timer}
+        # _rec_timer must stay alive: it polls latest_recording_active
+        # and drives the unified overlay's state transitions. Pausing
+        # it while in PERF + REC means an R-press to stop recording
+        # leaves the red half stuck on; an R-press to start recording
+        # while in PERF never slides the overlay to BOTH. Same exemption
+        # rationale as _perf_stats_timer (which keeps the Now sample
+        # fresh while the veil is up).
+        _perf_keep_alive = (self._perf_stats_timer, self._rec_timer)
         for val in self.__dict__.values():
             if (isinstance(val, QTimer) and val.isActive()
-                    and val not in always_on):
+                    and val not in _perf_keep_alive):
                 val.stop()
                 self._perf_resume_timers.append(val)
 
@@ -5850,8 +5966,8 @@ class HudWindow(QMainWindow):
         self._performance_mode = False
         # Leave the sampler running — it's the source of the Before
         # snapshot the next time we enter Perf mode.
-        # Slide overlay back: REC stays full-screen if REC is still on,
-        # otherwise slides off entirely.
+        # Slide overlay back: REC stays full-screen if REC is still
+        # on, otherwise slides off entirely.
         self._update_mode_overlay_state()
 
         # Wake the camera + lidar workers — calling slot_ready() sets
@@ -5887,30 +6003,40 @@ class HudWindow(QMainWindow):
     # test script, or the HUD itself via _request_record_toggle / R key).
     # -----------------------------------------------------------------
     def _request_record_toggle(self):
-        """Flip ROS bag recording. Publishes the inverse of the current
-        latest_recording_active on /data/toggle_collect; the existing
-        subscriber updates state and _rec_tick reacts on the next tick.
-        Works whether or not a test script is also driving the topic."""
+        """Flip ROS bag recording. Spawns or stops a HUD-owned
+        `ros2 bag record` subprocess and publishes the new state on
+        /data/toggle_collect so the REC overlay (and any external
+        consumer such as the legacy video_recorder) sees the
+        transition. Works whether or not a test script is running."""
         node = getattr(self, '_ros_node', None)
         if node is None:
             return
         pub = getattr(node, 'toggle_collect_pub', None)
         if pub is None:
             return
+        new_active = not bool(getattr(node, 'latest_recording_active', False))
+        if new_active:
+            # Only flip the indicator if the recorder actually launches
+            # — otherwise the REC overlay would lie about an active bag.
+            if not self._start_hud_bag_record():
+                return
+        else:
+            self._stop_hud_bag_record()
         msg = Bool()
-        msg.data = not bool(getattr(node, 'latest_recording_active', False))
+        msg.data = new_active
         pub.publish(msg)
 
     def _rec_tick(self):
         """20 Hz tick. Reads HudNode.latest_recording_active and:
-          • On OFF→ON edge: snapshot existing dot styles, show the
-            overlay.
+          • On OFF→ON edge: snapshot existing dot styles, slide the
+            unified overlay to its REC or BOTH state.
           • While ON: ramp every status dot's background between
             #000000 and #ff0000 on a 2 Hz cosine.
-          • On ON→OFF edge: restore the snapshotted styles, hide the
-            overlay. (The existing participation-pulse code will
-            reassert correct colors on its own next tick; the
-            snapshot just spares us a flash of stale red.)
+          • On ON→OFF edge: restore the snapshotted styles, slide the
+            unified overlay back (PERF if Perf mode still on, else OFF).
+        The dot ramping is independent of the overlay — same code path
+        as before; only the overlay manipulation flows through
+        `_update_mode_overlay_state` now.
         """
         node = getattr(self, '_ros_node', None)
         active = bool(getattr(node, 'latest_recording_active', False))
@@ -5924,7 +6050,7 @@ class HudWindow(QMainWindow):
             except Exception:
                 self._dot_styles_before_rec = None
             self._rec_phase_t0 = time.monotonic()
-            self._rec_active = True  # set BEFORE update so state mapping is right
+            self._rec_active = True
             self._update_mode_overlay_state()
 
         elif not active and self._rec_active:
@@ -6056,17 +6182,17 @@ class HudWindow(QMainWindow):
         auto badge pinned.
 
         Qt fires resizeEvent during __init__ before the overlay widgets
-        exist, so getattr-guard every attribute we touch — otherwise the
-        first resize during construction raises AttributeError and kills
-        the Python process.
+        and the auto badge exist, so getattr-guard every attribute we
+        touch — otherwise the first resize during construction raises
+        AttributeError and kills the process.
         """
         super().resizeEvent(event)
         lock = getattr(self, '_lock_overlay', None)
         if lock is not None:
             lock.setGeometry(0, 0, self.width(), self.height())
-        # Unified mode overlay handles its own geometry — just hand it
-        # the new screen dimensions and it'll resize + snap to its
-        # current state.
+        # Unified mode overlay handles its own geometry; just hand it
+        # the new central-widget dimensions and it'll resize + snap to
+        # its current state.
         mode = getattr(self, '_mode_overlay', None)
         if mode is not None:
             central = self.centralWidget()
@@ -6167,6 +6293,165 @@ class HudWindow(QMainWindow):
                 f"Auto mode (from /autonomous_mode): "
                 f"{'ON' if self._auto_mode else 'OFF'}"
             )
+
+    # -----------------------------------------------------------------
+    # Manual Drive mode — 'M' key, green overlay, arrow-key teleop
+    # -----------------------------------------------------------------
+    def _toggle_manual_mode(self):
+        """M-key handler. Enter: disengage AUTO if on (control.cpp gates
+        /joy on !autonomousMode), show green overlay, start 20 Hz Joy
+        publish tick. Exit: publish a zero-axes Joy for safety, stop
+        tick, hide overlay. Arrow-key handling itself lives in
+        keyPressEvent / keyReleaseEvent."""
+        if not self._manual_mode:
+            # control.cpp ignores /joy while autonomousMode is true, so
+            # manual drive can't reach the motors. Toggle AUTO off first.
+            # Per the AUTO-toggle-keeps-goal invariant, this doesn't
+            # cancel any pending nav2 goal.
+            if self._auto_mode:
+                self._toggle_auto_mode()
+            if self._manual_overlay is None:
+                self._build_manual_overlay()
+            self._manual_overlay.setGeometry(0, 0, self.width(), self.height())
+            self._manual_overlay.show()
+            self._manual_overlay.raise_()
+            self._manual_keys.clear()
+            self._manual_mode = True
+            self._manual_timer.start()
+            self._gui_log_msg("Manual Drive: ON (arrows = drive, Esc/M = exit)")
+        else:
+            self._manual_mode = False
+            self._manual_timer.stop()
+            self._manual_keys.clear()
+            self._publish_manual_joy(0.0, 0.0)
+            if self._manual_overlay is not None:
+                self._manual_overlay.hide()
+            self._gui_log_msg("Manual Drive: OFF")
+
+    def _build_manual_overlay(self):
+        """Lazily build the green Manual Drive overlay. Semi-transparent
+        so the operator still sees the underlying sensor canvases."""
+        overlay = QWidget(self)
+        overlay.setObjectName("manualOverlay")
+        overlay.setStyleSheet(
+            "QWidget#manualOverlay { background-color: rgba(0, 200, 0, 110); }"
+        )
+        overlay.setAutoFillBackground(True)
+        overlay.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        overlay.setGeometry(0, 0, self.width(), self.height())
+
+        v = QVBoxLayout(overlay)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setAlignment(Qt.AlignCenter)
+        v.addStretch()
+
+        title = QLabel("MANUAL DRIVE")
+        f = QFont()
+        f.setPointSize(48)
+        f.setBold(True)
+        title.setFont(f)
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet(
+            "color: #fff; background: transparent; border: none;"
+        )
+        v.addWidget(title)
+
+        hint = QLabel("Arrow keys = drive   ·   M or Esc = exit")
+        hf = QFont()
+        hf.setPointSize(16)
+        hint.setFont(hf)
+        hint.setAlignment(Qt.AlignCenter)
+        hint.setStyleSheet(
+            "color: #eaffea; background: transparent; border: none;"
+        )
+        v.addWidget(hint)
+
+        speed_hint = QLabel("1-9 = speed gear   ·   1 → 5,  2 → 10,  …,  9 → 45")
+        sf = QFont()
+        sf.setPointSize(14)
+        speed_hint.setFont(sf)
+        speed_hint.setAlignment(Qt.AlignCenter)
+        speed_hint.setStyleSheet(
+            "color: #d6f5d6; background: transparent; border: none;"
+        )
+        v.addWidget(speed_hint)
+
+        controller_hint = QLabel("(Ensure XBox controller is off)")
+        cf = QFont()
+        cf.setPointSize(12)
+        cf.setItalic(True)
+        controller_hint.setFont(cf)
+        controller_hint.setAlignment(Qt.AlignCenter)
+        controller_hint.setStyleSheet(
+            "color: #c0e8c0; background: transparent; border: none;"
+        )
+        v.addWidget(controller_hint)
+
+        v.addStretch()
+        overlay.hide()
+        self._manual_overlay = overlay
+        return overlay
+
+    def _manual_tick(self):
+        """20 Hz publish tick while Manual Drive is on. Translates the
+        held arrow keys into tank-drive wheel commands and publishes via
+        synthetic Joy. control.cpp (tank-drive) maps axes[1]→left wheel,
+        axes[3]→right wheel; we synthesise those so this path is exactly
+        the Xbox stick path. Up = both forward; Down = both back; Left/
+        Right = spin in place; combinations mix (e.g. Up+Right curves
+        right). Opposed keys cancel."""
+        if not self._manual_mode:
+            return
+        fwd = 0.0
+        if Qt.Key_Up in self._manual_keys:
+            fwd += 1.0
+        if Qt.Key_Down in self._manual_keys:
+            fwd -= 1.0
+        turn = 0.0
+        if Qt.Key_Right in self._manual_keys:
+            turn += 1.0
+        if Qt.Key_Left in self._manual_keys:
+            turn -= 1.0
+        left  = max(-1.0, min(1.0, fwd + turn)) * self._MANUAL_STICK_MAG
+        right = max(-1.0, min(1.0, fwd - turn)) * self._MANUAL_STICK_MAG
+        self._publish_manual_joy(left, right)
+
+    def _publish_manual_speed_setpoint(self, gear):
+        """Publish an Int32 on /manual_speed_setpoint. control.cpp's
+        manual_speed_callback clamps to 0..75 and calls motors.setSpeed
+        directly, ignoring the request under AUTO. No-op if ROS isn't
+        available."""
+        node = self._ros_node
+        if node is None or not hasattr(node, 'manual_speed_pub'):
+            return
+        try:
+            Int32Msg = node.manual_speed_pub.msg_type
+            msg = Int32Msg()
+            msg.data = int(gear)
+            node.manual_speed_pub.publish(msg)
+            self._gui_log_msg(f"Manual speed setpoint: {gear}")
+        except Exception as e:
+            self._gui_log_msg(f"Manual speed publish failed: {e}")
+
+    def _publish_manual_joy(self, left_wheel, right_wheel):
+        """Publish a synthetic Joy message with the same shape control.cpp
+        expects: axes[1] = left stick Y (left wheel), axes[3] = right
+        stick Y (right wheel). Buttons left zero so we don't trigger
+        X-button (auto toggle) or bumper speed changes. No-op if ROS
+        isn't available."""
+        node = self._ros_node
+        if node is None or not hasattr(node, 'joy_pub'):
+            return
+        try:
+            JoyMsg = node.joy_pub.msg_type
+            msg = JoyMsg()
+            msg.buttons = [0] * 11
+            msg.axes = [0.0] * 8
+            msg.axes[1] = float(left_wheel)
+            msg.axes[3] = float(right_wheel)
+            node.joy_pub.publish(msg)
+        except Exception as e:
+            self._gui_log_msg(f"Manual joy publish failed: {e}")
 
     def _position_auto_badge(self):
         """Pin the auto-mode badge to the upper-right of the central widget."""
@@ -6415,6 +6700,15 @@ class HudWindow(QMainWindow):
         except Exception:
             pass
 
+        # Stop the HUD's bag recorder, if running. The recorder lives
+        # in its own process group via os.setsid, so it would otherwise
+        # outlive the GUI and leave an orphaned `ros2 bag record`
+        # (and an incomplete bag without metadata.yaml).
+        try:
+            self._stop_hud_bag_record()
+        except Exception:
+            pass
+
         # Stop live mode if active
         if self._live_active:
             self._stop_live_mode()
@@ -6485,19 +6779,50 @@ class HudWindow(QMainWindow):
         # filter (see eventFilter) so it works from any focus context,
         # including QLineEdit. No handling needed here.
 
+        # Manual Drive mode owns input while active: arrows drive the
+        # robot, 1-9 snap the speed gear, Esc/M exit, everything else is
+        # swallowed so the operator can't accidentally toggle Auto /
+        # Performance / Record mid-drive.
+        if self._manual_mode:
+            if key == Qt.Key_M and not event.modifiers():
+                self._toggle_manual_mode()
+                return
+            if key == Qt.Key_Escape:
+                self._toggle_manual_mode()
+                return
+            if key in (Qt.Key_Up, Qt.Key_Down, Qt.Key_Left, Qt.Key_Right):
+                if not event.isAutoRepeat():
+                    self._manual_keys.add(key)
+                return
+            if Qt.Key_1 <= key <= Qt.Key_9 and not event.modifiers():
+                if not event.isAutoRepeat():
+                    gear = (key - Qt.Key_0) * 5  # 1→5, 2→10, ..., 9→45
+                    self._publish_manual_speed_setpoint(gear)
+                return
+            return
+
+        # 'M' enters Manual Drive (green overlay + arrow-key teleop).
+        # Same mod/focus rules as 'A': window-level only, no modifiers,
+        # so typing 'm' into a focused QLineEdit still enters the char.
+        if key == Qt.Key_M and not event.modifiers():
+            self._toggle_manual_mode()
+            return
+
         # 'A' toggles auto mode. No modifiers so it doesn't fight Ctrl+A
         # or similar; intentionally only handled at the window level so
         # that typing 'a' into a focused QLineEdit (send_goal / GPS
-        # field / lock password) still enters the character. 'P' and 'R'
-        # follow the same pattern: 'P' toggles Performance mode, 'R'
-        # toggles ROS-bag recording. Both work from any screen and at
-        # any time — no test script required.
+        # field / lock password) still enters the character.
         if key == Qt.Key_A and not event.modifiers():
             self._toggle_auto_mode()
             return
+
+        # 'P' toggles Performance Mode — same mod/focus rules as 'A'.
         if key == Qt.Key_P and not event.modifiers():
             self._on_performance_clicked()
             return
+
+        # 'R' toggles ROS-bag recording — same mod/focus rules as 'A'.
+        # Works from any screen and at any time, no test script required.
         if key == Qt.Key_R and not event.modifiers():
             self._request_record_toggle()
             return
@@ -6637,6 +6962,18 @@ class HudWindow(QMainWindow):
                 self._on_play_pause()
         else:
             super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event):
+        """Manual Drive needs key-release tracking so the robot stops the
+        moment the operator lets go. Outside manual mode this is a no-op
+        — the existing keyPressEvent owns all input semantics."""
+        if self._manual_mode:
+            key = event.key()
+            if key in (Qt.Key_Up, Qt.Key_Down, Qt.Key_Left, Qt.Key_Right):
+                if not event.isAutoRepeat():
+                    self._manual_keys.discard(key)
+                return
+        super().keyReleaseEvent(event)
 
     def _update_selection(self):
         """Restyle all buttons: selected gets highlight + mirrored arrows, others reset."""
@@ -6829,10 +7166,15 @@ class HudWindow(QMainWindow):
     # -- Container connection ------------------------------------------------
 
     def _on_connect_container(self):
-        """Toggle connection to the Docker container."""
+        """Toggle connection to the Docker container. Explicit click is
+        the only path that touches _container_user_disconnected — the
+        sticky flag goes True on disconnect (stops auto-reconnect) and
+        clears on a successful connect."""
         if self._container_connected:
+            self._container_user_disconnected = True
             self._disconnect_container()
         else:
+            self._container_user_disconnected = False
             self._connect_container()
 
     def _connect_container(self):
@@ -6974,20 +7316,38 @@ class HudWindow(QMainWindow):
         self._refresh_terminal_display()
 
     def _check_container_health(self):
-        """Periodic check: if connected, verify the container is still running."""
-        if not self._container_connected:
-            return
+        """Periodic check (5 Hz). Two jobs:
+          1. If connected, drop the connection when the container stops.
+          2. If not connected AND the user hasn't explicitly disconnected,
+             auto-connect as soon as the container is up. This way the
+             GUI re-attaches on container restarts and on startup without
+             the operator having to click Connect.
+        """
         try:
             result = subprocess.run(
                 ['docker', 'ps', '--quiet', '--filter', 'status=running',
                  '--filter', f'name=^/{self._container_name}$'],
                 capture_output=True, text=True, timeout=3,
             )
-            if not result.stdout.strip():
-                self._gui_log_msg(f"Container '{self._container_name}' stopped — disconnecting")
-                self._disconnect_container()
         except Exception:
-            pass
+            return
+        running = bool(result.stdout.strip())
+
+        if self._container_connected:
+            if not running:
+                self._gui_log_msg(
+                    f"Container '{self._container_name}' stopped — disconnecting"
+                )
+                # Involuntary drop — sticky flag stays False so we
+                # auto-reconnect when the container comes back.
+                self._disconnect_container()
+            return
+
+        if running and not self._container_user_disconnected:
+            self._gui_log_msg(
+                f"Container '{self._container_name}' is up — auto-connecting"
+            )
+            self._connect_container()
 
     def _wrap_container_cmd(self, cmd, label=None):
         """Wrap a command to run inside the Docker container via docker exec.
@@ -7134,11 +7494,11 @@ class HudWindow(QMainWindow):
     # subscriptions watch, so the live canvases reanimate exactly as
     # they looked during the original test session.
     # -----------------------------------------------------------------
-    # Visual-only topic subset, used as the --topics filter for
-    # `ros2 bag play`. Mirrors base_automator.DEFAULT_BAG_TOPICS in
-    # the testing package — recording and playback should always
-    # match. If a topic is dropped from one list, drop it from the
-    # other.
+    # Visual-only topic subset. Used as the --topics filter for
+    # `ros2 bag play` AND as the record set passed to
+    # `_start_hud_bag_record` — recording and playback always match
+    # because they read the same list. Single source of truth lives
+    # here; the automated-testing package no longer keeps its own copy.
     #
     # Notably ABSENT: raw + inflated SICK IMU, /joy, /cmd_vel, /odom.
     # The IMU/joy/cmd_vel streams produce no pixel; together they were
@@ -7241,6 +7601,85 @@ class HudWindow(QMainWindow):
             self._gui_log_msg("Bag playback finished")
             self._bag_play_proc = None
             self._bag_play_poll_timer.stop()
+
+    # -----------------------------------------------------------------
+    # ROS bag RECORDING — operator-driven via the R key. Spawns
+    # `ros2 bag record` capturing the same topic set the playback /
+    # baker stack reads, into _CSV_DIR/manual_<stamp>/bag/.
+    # -----------------------------------------------------------------
+    def _start_hud_bag_record(self):
+        """Spawn `ros2 bag record` for _BAG_PLAYBACK_TOPICS into
+        _CSV_DIR/manual_<YYYYMMDD_HHMMSS>/bag/. Returns True on
+        success, False if the process couldn't be launched (e.g. ros2
+        not on PATH or the output directory could not be created)."""
+        if self._hud_bag_proc is not None and self._hud_bag_proc.poll() is None:
+            self._gui_log_msg("Bag recorder already running — ignoring start.")
+            return True
+        stamp = time.strftime('%Y%m%d_%H%M%S')
+        session_dir = os.path.join(self._CSV_DIR, f'manual_{stamp}')
+        # `ros2 bag record` creates the leaf bag/ directory itself —
+        # if it already exists it bails. Only pre-create the session
+        # parent so the leaf is free for ros2 to claim.
+        try:
+            os.makedirs(session_dir, exist_ok=True)
+        except OSError as e:
+            self._gui_log_msg(f"Failed to create bag directory: {e}")
+            return False
+        bag_dir = os.path.join(session_dir, 'bag')
+        cmd = [
+            'ros2', 'bag', 'record',
+            '-o', bag_dir,
+            '--max-cache-size', str(1_000_000_000),
+            *self._BAG_PLAYBACK_TOPICS,
+        ]
+        try:
+            self._hud_bag_proc = subprocess.Popen(
+                cmd,
+                preexec_fn=os.setsid,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            self._gui_log_msg(
+                "ros2 not on PATH — can't start bag recorder. "
+                "Source the ROS2 setup before launching the GUI."
+            )
+            self._hud_bag_proc = None
+            return False
+        self._gui_log_msg(
+            f"Recording bag: {bag_dir} "
+            f"({len(self._BAG_PLAYBACK_TOPICS)} topics)"
+        )
+        return True
+
+    def _stop_hud_bag_record(self):
+        """SIGINT the HUD's bag-record subprocess and wait briefly for
+        clean shutdown. Falls back to SIGKILL on timeout so a wedged
+        recorder never blocks GUI exit. Idempotent."""
+        proc = self._hud_bag_proc
+        if proc is None:
+            return
+        if proc.poll() is not None:
+            self._hud_bag_proc = None
+            return
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGINT)
+        except ProcessLookupError:
+            self._hud_bag_proc = None
+            return
+        try:
+            proc.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            self._gui_log_msg(
+                "Bag recorder did not exit within 5 s; sending SIGKILL"
+            )
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait()
+        self._gui_log_msg("Bag recorder stopped.")
+        self._hud_bag_proc = None
 
     def _load_csv(self, path):
         self._gui_log_msg(f"Loading CSV: {os.path.basename(path)}")
@@ -9171,6 +9610,13 @@ if _HAS_ROS:
             # pattern as t002_automator._send_x_button_to_control.
             self.latest_autonomous_mode = None  # None until first /autonomous_mode msg
             self.joy_pub = self.create_publisher(Joy, '/joy', 10)
+            # Direct manual-speed setpoint for the HUD's Manual Drive
+            # mode (1-9 keys → 5/10/15/.../45 gear). control.cpp
+            # subscribes and snaps motors.setSpeed() — bypasses the slow
+            # bumper ramp (200 ms per +1). Honored only when !autonomousMode.
+            self.manual_speed_pub = self.create_publisher(
+                Int32, '/manual_speed_setpoint', 10,
+            )
             self.create_subscription(
                 Bool, '/autonomous_mode',
                 self._cb_autonomous_mode, _RELIABLE_QOS,

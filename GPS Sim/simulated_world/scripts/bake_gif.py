@@ -33,7 +33,7 @@ _ROOT = os.path.dirname(_HERE)
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-import src.gps_sim_gui as m
+import gps_sim_gui as m
 
 
 def main():

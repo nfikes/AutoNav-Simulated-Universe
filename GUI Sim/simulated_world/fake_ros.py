@@ -286,6 +286,7 @@ def install(verbose=False):
     std_msgs_msg_mod = _build_module(
         'std_msgs.msg',
         Float32=_msg_class('Float32'),
+        Int32=_msg_class('Int32'),
         Int32MultiArray=_msg_class('Int32MultiArray'),
         Bool=_msg_class('Bool'),
     )

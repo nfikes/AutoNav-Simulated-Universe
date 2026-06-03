@@ -78,5 +78,8 @@ tile_cache/
 GUI Sim/data/manual_*/
 **/data/manual_*/
 
+# Blender autosave backups
+*.blend1
+
 # Editor / Claude local state
 .claude/settings.local.json

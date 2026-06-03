@@ -1,0 +1,2 @@
+numpy==2.4.6
+pygame-ce==2.5.7
